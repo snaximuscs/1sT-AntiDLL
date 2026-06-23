@@ -1,0 +1,19 @@
+{
+  "PluginEnabled": true,
+  "DebugMode": false,
+  "CheckIntervalSeconds": 10.0,
+  "MaxViolationThreshold": 100,
+  "PointsPerDetection": 50,
+  "PointDecayPerMinute": 10,
+  "PunishmentType": "kick",
+  "DiscordWebhookUrl": "https://discord.com/api/webhooks/YOUR_WEBHOOK_HERE",
+  "IgnoreAdmins": true,
+  "IgnoreBots": true,
+  "MaxPingTolerance": 150,
+  "BlacklistedCvars": [
+    "midnight_menu",
+    "neverlose_menu",
+    "aimbot_enable",
+    "esp_enable"
+  ]
+}
