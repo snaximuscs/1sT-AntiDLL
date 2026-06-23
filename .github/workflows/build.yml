@@ -16,12 +16,14 @@ jobs:
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     permissions:
       contents: write
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
 
     env:
       HL2SDK_ROOT: "${{ github.workspace }}/external"
       MMS_PATH: "${{ github.workspace }}/external/metamod-source"
       MANIFEST_PATH: "${{ github.workspace }}/external/metamod-source/hl2sdk-manifests"
+      CC: clang
+      CXX: clang++
 
     steps:
       - name: Generate build number
@@ -29,54 +31,74 @@ jobs:
         id: buildnumber
         uses: onyxmueller/build-tag-number@v1
         with:
-          token: ${{secrets.github_token}}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
       - name: Set up dependencies
         run: |
           export DEBIAN_FRONTEND=noninteractive
+          
+          # 1. APT кэш цэвэрлэж, шаардлагатай үндсэн багцуудыг суулгах (Хуучин clang-10-ийг хассан)
+          sudo apt-get clean
           sudo apt-get update -qy
-          sudo apt-get install -y git clang-10 clang++-10 binutils
-          sudo apt-get install -y python3
-          python3 -m pip install --upgrade pip importlib-metadata
-          python3 -m pip install setuptools==45.2.0
-          git clone https://github.com/alliedmodders/ambuild.git
-          cd ambuild
-          pip install .
-          cd ..
-          mkdir external
+          sudo apt-get install -y git binutils zip python3-pip python3-setuptools
+          
+          # 2. AMBuild-ийг хамгийн цэвэр хувилбараар суулгах
+          python3 -m pip install --upgrade pip
+          python3 -m pip install git+https://github.com/alliedmodders/ambuild.git
+          
+          # 3. Гадаад SDK сангуудыг татах
+          mkdir -p external
           cd external
           git clone --recursive --branch master --single-branch https://github.com/alliedmodders/metamod-source.git
           git clone --recursive --branch cs2 --single-branch https://github.com/alliedmodders/hl2sdk.git hl2sdk-cs2
-          cd ../..
-          git clone https://github.com/pisex/SchemaEntity.git
-          cd ${{ github.workspace }}
           
+          # 4. SchemaEntity-ийг татах
+          cd ${{ github.workspace }}
+          git clone https://github.com/pisex/SchemaEntity.git ../SchemaEntity
+          
+          # 5. Шинэ CS2 SDK-д зориулсан кодын нөхөөс (Patch) хийх
+          echo "SchemaEntity-д CS2 SDK шинэчлэлтийн нөхөөс хийж байна..."
+          sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' ../SchemaEntity/schemasystem.cpp
+
       - name: Configure and build plugin
         run: |
-          mkdir build
+          mkdir -p build
           cd build
-          python3 ../configure.py -s cs2 --targets x86_64 --enable-optimize --hl2sdk-manifests=./hl2sdk-manifests --mms_path=$MMS_PATH --hl2sdk-root=$HL2SDK_ROOT
+          python3 ../configure.py -s cs2 --targets x86_64 --enable-optimize --hl2sdk-manifests=$MANIFEST_PATH --mms_path=$MMS_PATH --hl2sdk-root=$HL2SDK_ROOT
           ambuild
 
       - name: Create archive
         run: |
-          cd build/package
-          zip -r ${{ github.workspace }}.zip addons
+          if [ -d "build/package" ]; then
+            cd build/package
+            zip -r ../../plugin.zip addons
+          else
+            cd build
+            zip -r ../plugin.zip .
+          fi
 
       - name: Upload archive to artifact
         uses: actions/upload-artifact@v4
         with:
           name: compile
-          path: ${{ github.workspace }}.zip
+          path: plugin.zip
 
   release:
     needs: build
+    if: github.event_name == 'release'
     permissions:
       contents: write
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest # <-- Гацаж байсан ubuntu-20.04 хувилбарыг шинэчлэв
   
     steps:
       - name: Download build artifact
@@ -85,15 +107,9 @@ jobs:
           name: compile
           path: .
   
-      - name: List files in directory
-        run: ls -la
-  
-      - name: Find downloaded artifact
-        id: find_artifact
-        run: echo "ARTIFACT=$(ls | grep '\.zip$')" >> $GITHUB_ENV
-  
-      - name: Upload release
+      - name: Upload release assets
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.event.head_commit.message }}
-          files: ${{ env.ARTIFACT }}
+          files: plugin.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
