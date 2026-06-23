@@ -8,6 +8,10 @@
 #include <mutex>
 #include <thread>
 
+// Хэрэв таны cpp дээр ашиглагдаж байгаа бол эдгээр API-г урьдчилан зарлана
+class IUtilsApi;
+class IPlayersApi;
+
 // Тоглогчийн төлөвийг хадгалах бүтэц
 struct PlayerState {
     int slot;
@@ -34,7 +38,8 @@ struct AntiDllConfig {
     std::vector<std::string> blacklistedCvars;
 };
 
-class AntiDllPlugin : public ISmmPlugin
+// Классын нэрийг таны cpp-тэй ижил "AntiDLL" болгон өөрчлөв
+class AntiDLL : public ISmmPlugin, public IMetamodListener
 {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late);
@@ -42,14 +47,14 @@ public:
     
     // Metamod Hooks
     void AllPluginsLoaded();
-    const char* GetAuthor() { return "Snaximusss+"; }
-    const char* GetName() { return "1sT-AntiDLL"; }
-    const char* GetDescription() { return "Server-side defensive anti-cheat plugin"; }
-    const char* GetURL() { return ""; }
-    const char* GetLicense() { return "GPL"; }
-    const char* GetVersion() { return "2.0.0-C++"; }
-    const char* GetDate() { return __DATE__; }
-    const char* GetLogTag() { return "ANTIDLL"; }
+    const char* GetAuthor();
+    const char* GetName();
+    const char* GetDescription();
+    const char* GetURL();
+    const char* GetLicense();
+    const char* GetVersion();
+    const char* GetDate();
+    const char* GetLogTag();
 
     // Game Frame Handler
     void GameFrame(bool simulating);
@@ -68,5 +73,5 @@ private:
     double m_LastCheckTime = 0.0;
 };
 
-extern AntiDllPlugin g_AntiDllPlugin;
+extern AntiDLL g_AntiDLL;
 PLUGIN_GLOBALVARS();
