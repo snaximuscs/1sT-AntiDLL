@@ -1,7 +1,6 @@
 #pragma once
 
 #include <ISmmPlugin.h>
-#include <engine/iserverplugin.h>
 #include <entity2/entitysystem.h>
 #include <vector>
 #include <string>
@@ -35,7 +34,7 @@ struct AntiDllConfig {
     std::vector<std::string> blacklistedCvars;
 };
 
-class AntiDllPlugin : public ISmmPlugin, public IServerPluginCallbacks
+class AntiDllPlugin : public ISmmPlugin
 {
 public:
     bool Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late);
