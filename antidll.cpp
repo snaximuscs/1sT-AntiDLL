@@ -2,7 +2,6 @@
 #include "antidll.h"
 #include "metamod_oslink.h"
 #include "schemasystem/schemasystem.h"
-#include "CCSPlayerController.h"
 #include "raytrace.h"
 #include "webhook_queue.h"
 #include <igameevents.h>
@@ -154,46 +153,89 @@ static Vector AnglesToForward(const QAngle& angles)
     return Vector(cosf(pitch) * cosf(yaw), cosf(pitch) * sinf(yaw), -sinf(pitch));
 }
 
-static CCSPlayerPawn* GetPlayerPawn(int slot)
+// SchemaEntity's schemasystem.cpp (compiled via AMBuilder) provides this.
+namespace schema {
+    int32_t GetServerOffset(const char* pszClassName, const char* pszPropName);
+}
+
+static CEntityInstance* GetPlayerPawn(int slot)
 {
-    CCSPlayerController* ctrl = CCSPlayerController::FromSlot(slot);
+    if (!g_pEntitySystem) return nullptr;
+    CEntityInstance* ctrl = g_pEntitySystem->GetEntityInstance(CEntityIndex(slot + 1));
     if (!ctrl) return nullptr;
-    return ctrl->GetPlayerPawn();
+
+    static int32_t off = schema::GetServerOffset("CBasePlayerController", "m_hPawn");
+    if (off == -1) return nullptr;
+
+    uint32_t handle = *reinterpret_cast<uint32_t*>(reinterpret_cast<uintptr_t>(ctrl) + off);
+    if (handle == 0xFFFFFFFF) return nullptr;
+
+    return g_pGameEntitySystem->GetEntityInstance(CEntityIndex(handle & 0x7FFF));
 }
 
 static Vector GetPlayerPosition(int slot)
 {
-    CCSPlayerPawn* pawn = GetPlayerPawn(slot);
+    CEntityInstance* pawn = GetPlayerPawn(slot);
     if (!pawn) return Vector(0, 0, 0);
-    return pawn->GetAbsOrigin();
+
+    static int32_t bodyOff = schema::GetServerOffset("CBaseEntity", "m_CBodyComponent");
+    if (bodyOff == -1) return Vector(0, 0, 0);
+    void* body = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pawn) + bodyOff);
+    if (!body) return Vector(0, 0, 0);
+
+    static int32_t sceneOff = schema::GetServerOffset("CBodyComponent", "m_pSceneNode");
+    if (sceneOff == -1) return Vector(0, 0, 0);
+    void* scene = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(body) + sceneOff);
+    if (!scene) return Vector(0, 0, 0);
+
+    static int32_t originOff = schema::GetServerOffset("CGameSceneNode", "m_vecAbsOrigin");
+    if (originOff == -1) return Vector(0, 0, 0);
+    return *reinterpret_cast<Vector*>(reinterpret_cast<uintptr_t>(scene) + originOff);
 }
 
 static Vector GetPlayerEyePosition(int slot)
 {
-    CCSPlayerPawn* pawn = GetPlayerPawn(slot);
+    Vector origin = GetPlayerPosition(slot);
+    if (IsZeroVector(origin)) return origin;
+
+    CEntityInstance* pawn = GetPlayerPawn(slot);
     if (!pawn) return Vector(0, 0, 0);
-    return pawn->GetEyePosition();
+
+    static int32_t off = schema::GetServerOffset("CBaseModelEntity", "m_vecViewOffset");
+    if (off == -1) { origin.z += 64.0f; return origin; }
+
+    Vector view = *reinterpret_cast<Vector*>(reinterpret_cast<uintptr_t>(pawn) + off);
+    return Vector(origin.x + view.x, origin.y + view.y, origin.z + view.z);
 }
 
 static QAngle GetPlayerEyeAngles(int slot)
 {
-    CCSPlayerPawn* pawn = GetPlayerPawn(slot);
+    CEntityInstance* pawn = GetPlayerPawn(slot);
     if (!pawn) return QAngle(0, 0, 0);
-    return pawn->m_angEyeAngles();
+
+    static int32_t off = schema::GetServerOffset("CCSPlayerPawn", "m_angEyeAngles");
+    if (off == -1) return QAngle(0, 0, 0);
+    return *reinterpret_cast<QAngle*>(reinterpret_cast<uintptr_t>(pawn) + off);
 }
 
 static int GetPlayerTeam(int slot)
 {
-    CCSPlayerPawn* pawn = GetPlayerPawn(slot);
+    CEntityInstance* pawn = GetPlayerPawn(slot);
     if (!pawn) return 0;
-    return pawn->m_iTeamNum();
+
+    static int32_t off = schema::GetServerOffset("CBaseEntity", "m_iTeamNum");
+    if (off == -1) return 0;
+    return *reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(pawn) + off);
 }
 
 static bool IsPlayerAlive(int slot)
 {
-    CCSPlayerPawn* pawn = GetPlayerPawn(slot);
+    CEntityInstance* pawn = GetPlayerPawn(slot);
     if (!pawn) return false;
-    return pawn->IsAlive();
+
+    static int32_t off = schema::GetServerOffset("CBaseEntity", "m_lifeState");
+    if (off == -1) return false;
+    return *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(pawn) + off) == 0;
 }
 
 static bool IsValidHumanPlayer(int slot)
