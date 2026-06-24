@@ -26,12 +26,13 @@ for sdk_target in MMSPlugin.sdk_targets:
   # binary.compiler.cxxincludes += [ os.environ.get('RAYTRACE_PUBLIC', os.path.join(builder.sourcePath, '..', 'Ray-Trace', 'public')) ]
   # binary.compiler.defines += ['ANTIDLL_HAVE_RAYTRACE']
 
-  binary.compiler.postlink += ['-lpthread']
+  binary.compiler.postlink += ['-lpthread', '-ldl']
 
   binary.sources += [
     'antidll.cpp',
     'raytrace.cpp',
     'webhook_queue.cpp',
+    'mysql_manager.cpp',
     os.path.join('..', 'SchemaEntity', 'schemasystem.cpp'),
   ]
 

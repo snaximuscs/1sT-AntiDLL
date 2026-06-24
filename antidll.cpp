@@ -4,13 +4,14 @@
 #include "schemasystem/schemasystem.h"
 #include "raytrace.h"
 #include "webhook_queue.h"
+#include "mysql_manager.h"
 #include <igameevents.h>
 #include <fstream>
 #include <ctime>
 #include <algorithm>
 
 //==============================================================================
-// AntiDLLCore — globals & SDK plumbing
+// Globals & SDK plumbing
 //==============================================================================
 
 AntiDLL g_AntiDLL;
@@ -23,8 +24,38 @@ CGlobalVars* gpGlobals = nullptr;
 IUtilsApi* g_pUtils = nullptr;
 IPlayersApi* g_pPlayers = nullptr;
 
+static std::string  g_MapName = "unknown";
+static bool         g_RoundActive = true;
+
 //==============================================================================
-// ConfigManager
+// Detection categories
+//==============================================================================
+
+enum DetCategory
+{
+    DET_DLL_EVENT = 0,
+    DET_HIDDEN_TARGET,
+    DET_AIM_SNAP,
+    DET_TRIGGER,
+    DET_COMPOSITE,
+    DET_COUNT
+};
+
+static const char* DetCategoryStr(DetCategory c)
+{
+    switch (c)
+    {
+    case DET_DLL_EVENT:     return "DLL/Event Abuse";
+    case DET_HIDDEN_TARGET: return "Visibility/Hidden Target Tracking";
+    case DET_AIM_SNAP:      return "Aim Pattern";
+    case DET_TRIGGER:       return "Trigger Pattern";
+    case DET_COMPOSITE:     return "Composite Risk";
+    default:                return "Unknown";
+    }
+}
+
+//==============================================================================
+// Config
 //==============================================================================
 
 struct Config
@@ -33,19 +64,24 @@ struct Config
     bool  enabled        = true;
     bool  debugMode      = false;
     bool  ignoreBots     = true;
-    bool  ignoreAdmins   = true;   // TODO: no admin API exposed by IPlayersApi; currently a no-op
+    bool  ignoreAdmins   = true;
 
     // --- Violation Points ---
     int   violationThreshold = 300;
-    int   pointsPerDetection = 50;   // legacy DLL detection points
+    int   pointsPerDetection = 50;
     int   pointDecay         = 10;
     float decayInterval      = 30.0f;
+
+    // --- Punishment ---
+    int          punishType   = 0;
+    std::string  punishCommand;
+    std::string  chatMessage;
 
     // --- RayTrace Visibility ---
     bool  raytraceRequired  = true;
     bool  raytraceDebugBeam = false;
 
-    // --- Suspicious Hidden-Target Tracking ---
+    // --- Hidden-Target Tracking ---
     bool  whEnabled          = false;
     bool  whDebugOnly        = true;
     float whCheckInterval    = 0.5f;
@@ -57,28 +93,61 @@ struct Config
     int   whViolationPoints  = 25;
     float whDotThreshold     = 0.995f;
 
-    // --- Legacy DLL detection (event-listener probe) ---
-    int          punishType   = 0;
-    std::string  punishCommand;
-    std::string  chatMessage;
-    float        dllInterval  = 5.0f;
+    // --- DLL detection (event-listener probe) ---
+    float dllInterval = 5.0f;
+
+    // --- Aim Pattern Detection ---
+    bool  aimEnabled           = true;
+    bool  aimDebugOnly         = true;
+    float aimCheckInterval     = 0.25f;
+    int   aimMinSamples        = 5;
+    float aimSnapAngleThreshold = 30.0f;
+    float aimSnapDotThreshold  = 0.96f;
+    float aimCooldown          = 30.0f;
+    int   aimPoints            = 15;
+
+    // --- Trigger Pattern Detection ---
+    bool  triggerEnabled       = true;
+    bool  triggerDebugOnly     = true;
+    int   triggerMinSamples    = 5;
+    float triggerMaxReactionSec = 0.5f;
+    float triggerCooldown      = 30.0f;
+    int   triggerPoints        = 15;
+
+    // --- Composite Risk ---
+    bool  compositeEnabled       = true;
+    int   compositeMinCategories = 3;
+    int   compositeBonusPoints   = 50;
 
     // --- Logging ---
     bool         logs    = true;
     std::string  logFile = "addons/AntiDLL/logs/antidll.log";
 
     // --- Discord ---
-    bool         webhookEnabled  = false;
+    bool         webhookEnabled     = false;
     std::string  webhookUrl;
-    int          webhookMinPoints = 25;
+    int          webhookMinPoints   = 25;
+    bool         webhookPluginLoad  = true;
+    bool         webhookViolations  = true;
+    bool         webhookPunishments = true;
+
+    // --- Server identity ---
+    std::string  serverPublicIp;
+    int          serverPort           = 0;
+    std::string  serverNameFallback   = "Unknown Server";
+    float        identityRefreshInterval = 300.0f;
+
+    // --- MySQL ---
+    MySQLConfig  mysql;
 };
 
 static Config g_Cfg;
-static std::vector<std::string> g_vEvents;      // legacy event-listener blacklist
+static std::vector<std::string> g_vEvents;
 static WebhookQueue g_Webhook;
+static MySQLManager g_MySQL;
 
 //==============================================================================
-// PlayerStateManager
+// PlayerState
 //==============================================================================
 
 struct PlayerState
@@ -88,14 +157,30 @@ struct PlayerState
     int         points = 0;
     double      lastViolationTime = 0.0;
     bool        punished = false;
-    std::vector<std::string> history;   // recent suspicion reasons
+    std::vector<std::string> history;
+    int         evidenceCount[DET_COUNT] = {};
 
-    // Hidden-target tracking working state
-    int    whTargetSlot = -1;
-    double whTrackStart = 0.0;
-    double whLastSample = 0.0;
-    int    whSampleCount = 0;
-    double whLastViolationTime = 0.0;   // cooldown anchor
+    // Hidden-target tracking
+    int    whTargetSlot      = -1;
+    double whTrackStart      = 0.0;
+    double whLastSample      = 0.0;
+    int    whSampleCount     = 0;
+    double whLastViolationTime = 0.0;
+
+    // Aim pattern tracking
+    QAngle prevAngles;
+    double prevAngleTime     = 0.0;
+    bool   hasPrevAngles     = false;
+    int    prevShotsFired    = 0;
+    int    aimSnapEvidence   = 0;
+    double aimLastViolationTime = 0.0;
+
+    // Trigger pattern tracking
+    struct TargetVis { bool wasVisible = false; double changeTime = 0.0; };
+    std::unordered_map<int, TargetVis> targetVis;
+    int    triggerEvidence    = 0;
+    double triggerLastViolationTime = 0.0;
+    int    triggerPrevShotsFired = 0;
 };
 
 static std::unordered_map<int, PlayerState> g_States;
@@ -110,14 +195,8 @@ static void ResetPlayer(int slot)
 }
 
 //==============================================================================
-// Utils — math & entity access
+// Math & entity access
 //==============================================================================
-
-static CEntityInstance* GetEntity(int slot)
-{
-    if (!g_pGameEntitySystem) return nullptr;
-    return g_pGameEntitySystem->GetEntityInstance(CEntityIndex(slot + 1));
-}
 
 static bool IsZeroVector(const Vector& v)
 {
@@ -153,7 +232,15 @@ static Vector AnglesToForward(const QAngle& angles)
     return Vector(cosf(pitch) * cosf(yaw), cosf(pitch) * sinf(yaw), -sinf(pitch));
 }
 
-// SchemaEntity's schemasystem.cpp (compiled via AMBuilder) provides this.
+static float AngleDelta(const QAngle& a, const QAngle& b)
+{
+    float dp = a.x - b.x;
+    float dy = a.y - b.y;
+    while (dy >  180.0f) dy -= 360.0f;
+    while (dy < -180.0f) dy += 360.0f;
+    return sqrtf(dp * dp + dy * dy);
+}
+
 namespace schema {
     int32_t GetServerOffset(const char* pszClassName, const char* pszPropName);
 }
@@ -238,39 +325,97 @@ static bool IsPlayerAlive(int slot)
     return *reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(pawn) + off) == 0;
 }
 
+static int GetPlayerShotsFired(int slot)
+{
+    CEntityInstance* pawn = GetPlayerPawn(slot);
+    if (!pawn) return 0;
+
+    static int32_t off = schema::GetServerOffset("CCSPlayerPawn", "m_iShotsFired");
+    if (off == -1) return 0;
+    return *reinterpret_cast<int32_t*>(reinterpret_cast<uintptr_t>(pawn) + off);
+}
+
 static bool IsValidHumanPlayer(int slot)
 {
     if (slot < 0 || slot >= 64) return false;
     if (!g_pPlayers) return false;
-    if (g_pPlayers->IsFakeClient(slot)) return false;   // covers ignore_bots
+    if (g_pPlayers->IsFakeClient(slot)) return false;
     if (!g_pPlayers->IsInGame(slot)) return false;
     if (g_pPlayers->GetSteamID64(slot) == 0) return false;
     return true;
 }
 
-// Body sample points used for visibility tracing (head / chest / pelvis; feet optional).
-static std::vector<Vector> GetPlayerBodyPoints(int slot)
+static bool IsWarmupPeriod()
 {
-    Vector o = GetPlayerPosition(slot);
-    return {
-        Vector(o.x, o.y, o.z + 72.0f), // head
-        Vector(o.x, o.y, o.z + 52.0f), // chest
-        Vector(o.x, o.y, o.z + 36.0f), // pelvis
-    };
+    CCSGameRules* rules = g_pUtils ? g_pUtils->GetCCSGameRules() : nullptr;
+    if (!rules) return false;
+    static int32_t off = schema::GetServerOffset("CCSGameRules", "m_bWarmupPeriod");
+    if (off == -1) return false;
+    return *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(rules) + off);
+}
+
+static bool IsFreezePeriod()
+{
+    CCSGameRules* rules = g_pUtils ? g_pUtils->GetCCSGameRules() : nullptr;
+    if (!rules) return false;
+    static int32_t off = schema::GetServerOffset("CCSGameRules", "m_bFreezePeriod");
+    if (off == -1) return false;
+    return *reinterpret_cast<bool*>(reinterpret_cast<uintptr_t>(rules) + off);
+}
+
+static int GetPlayerCount()
+{
+    int n = 0;
+    if (!g_pPlayers) return 0;
+    for (int i = 0; i < 64; i++)
+        if (g_pPlayers->IsInGame(i)) n++;
+    return n;
+}
+
+static int GetMaxClients()
+{
+    return gpGlobals ? gpGlobals->maxClients : 0;
 }
 
 //==============================================================================
-// RayTraceVisibility — high-level enemy visibility
+// Server identity helpers
 //==============================================================================
 
-// Returns true if ANY checked body point of the enemy is visible from the viewer's eye.
-// Fail-safe: if Ray-Trace or entity data is missing, returns true (visible) so we never flag.
+static std::string GetServerDisplayName()
+{
+    if (g_MySQL.IsConnected())
+    {
+        ServerIdentity id = g_MySQL.GetIdentity();
+        if (id.resolved && !id.name.empty())
+            return id.name;
+    }
+    return g_Cfg.serverNameFallback.empty() ? "Unknown Server" : g_Cfg.serverNameFallback;
+}
+
+static std::string GetServerAddress()
+{
+    std::string ip = g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp;
+    int port = g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015;
+    return ip + ":" + std::to_string(port);
+}
+
+static std::string GetPlayerCountStr()
+{
+    return std::to_string(GetPlayerCount()) + "/" + std::to_string(GetMaxClients());
+}
+
+//==============================================================================
+// RayTrace visibility
+//==============================================================================
+
 static bool IsEnemyVisibleByRayTrace(int viewerSlot, int enemySlot)
 {
     if (!RayTrace_IsAvailable())
         return true;
 
-    CEntityInstance* viewer = GetEntity(viewerSlot);
+    CEntityInstance* viewer = g_pGameEntitySystem
+        ? g_pGameEntitySystem->GetEntityInstance(CEntityIndex(viewerSlot + 1))
+        : nullptr;
     if (!viewer)
         return true;
 
@@ -280,21 +425,21 @@ static bool IsEnemyVisibleByRayTrace(int viewerSlot, int enemySlot)
         return true;
 
     const Vector points[3] = {
-        Vector(origin.x, origin.y, origin.z + 72.0f), // head
-        Vector(origin.x, origin.y, origin.z + 52.0f), // chest
-        Vector(origin.x, origin.y, origin.z + 36.0f), // pelvis
+        Vector(origin.x, origin.y, origin.z + 72.0f),
+        Vector(origin.x, origin.y, origin.z + 52.0f),
+        Vector(origin.x, origin.y, origin.z + 36.0f),
     };
 
     for (const Vector& p : points)
     {
         if (!RayTrace_LineBlockedByWorld(eye, p, viewer))
-            return true; // a clear line exists -> enemy is visible
+            return true;
     }
-    return false; // every checked point blocked by world geometry -> hidden
+    return false;
 }
 
 //==============================================================================
-// Logger — structured, single-line records
+// Logger
 //==============================================================================
 
 static std::string NowString()
@@ -307,26 +452,12 @@ static std::string NowString()
     return buf;
 }
 
-static std::string GetMapName()
-{
-    // TODO: read gpGlobals/engine map name once the exact CS2 field is confirmed.
-    return "unknown";
-}
-
-static std::string GetServerName()
-{
-    // TODO: read the "hostname" cvar once ConVar value access is wired.
-    return "unknown";
-}
-
 static void LogStructured(const std::string& line)
 {
-    if (!g_Cfg.logs)
-        return;
+    if (!g_Cfg.logs) return;
 
     std::string full = "[" + NowString() + "] " + line;
 
-    // Best-effort write to the configured file; fall back to the Utils logger.
     std::ofstream f(g_Cfg.logFile, std::ios::app);
     if (f.is_open())
     {
@@ -343,8 +474,22 @@ static void LogStructured(const std::string& line)
 }
 
 //==============================================================================
-// DiscordWebhookQueue helpers
+// Discord webhook helpers — rich embed format
 //==============================================================================
+
+static std::string SqlEscape(const std::string& s)
+{
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s)
+    {
+        if (c == '\'') { out += "''"; }
+        else if (c == '\\') { out += "\\\\"; }
+        else if (c == '\0') { /* drop */ }
+        else out.push_back(c);
+    }
+    return out;
+}
 
 static std::string JsonEscape(const std::string& s)
 {
@@ -360,10 +505,35 @@ static std::string JsonEscape(const std::string& s)
     return out;
 }
 
+struct WebhookField
+{
+    std::string name;
+    std::string value;
+    bool        isInline = true;
+};
+
+static void WebhookSendRich(const std::string& title, const std::vector<WebhookField>& fields, int color)
+{
+    if (!g_Cfg.webhookEnabled || g_Cfg.webhookUrl.empty()) return;
+
+    std::string fj;
+    for (size_t i = 0; i < fields.size(); i++)
+    {
+        if (i > 0) fj += ",";
+        fj += "{\"name\":\"" + JsonEscape(fields[i].name) +
+              "\",\"value\":\"" + JsonEscape(fields[i].value) +
+              "\",\"inline\":" + (fields[i].isInline ? "true" : "false") + "}";
+    }
+
+    std::string payload = "{\"embeds\":[{\"title\":\"" + JsonEscape(title) +
+        "\",\"color\":" + std::to_string(color) +
+        ",\"fields\":[" + fj + "]}]}";
+    g_Webhook.Enqueue(payload);
+}
+
 static void WebhookSend(const std::string& title, const std::string& description, int color)
 {
-    if (!g_Cfg.webhookEnabled || g_Cfg.webhookUrl.empty())
-        return;
+    if (!g_Cfg.webhookEnabled || g_Cfg.webhookUrl.empty()) return;
 
     std::string payload = "{\"embeds\":[{\"title\":\"" + JsonEscape(title) +
         "\",\"description\":\"" + JsonEscape(description) +
@@ -371,11 +541,20 @@ static void WebhookSend(const std::string& title, const std::string& description
     g_Webhook.Enqueue(payload);
 }
 
+static std::vector<WebhookField> BuildServerFields()
+{
+    return {
+        {"Server",  GetServerDisplayName(),   true},
+        {"Address", GetServerAddress(),        true},
+        {"Map",     g_MapName,                 true},
+        {"Players", GetPlayerCountStr(),       true},
+    };
+}
+
 //==============================================================================
-// ConfigManager — load with safety clamps
+// Config loading
 //==============================================================================
 
-// Required by SchemaEntity (schemasystem.cpp calls GameEntitySystem() by name).
 CGameEntitySystem* GameEntitySystem()
 {
     return g_pUtils->GetCGameEntitySystem();
@@ -396,7 +575,8 @@ static void LoadEventFile()
     std::ifstream file(szPath);
     if (!file.is_open())
     {
-        g_pUtils->ErrorLog("[%s] Failed to load events file", g_PLAPI->GetLogTag());
+        if (g_pUtils)
+            g_pUtils->ErrorLog("[%s] Failed to load events file", g_PLAPI->GetLogTag());
         return;
     }
     std::string line;
@@ -415,12 +595,13 @@ static bool LoadConfig()
     KeyValues* pKV = new KeyValues("Config");
     if (!pKV->LoadFromFile(g_pFullFileSystem, "addons/configs/AntiDLL/settings.ini"))
     {
-        g_pUtils->ErrorLog("[%s] Failed to load config addons/configs/AntiDLL/settings.ini", g_PLAPI->GetLogTag());
-        WebhookSend("1sT-AntiDLL", "config reload failed", 0xE67E22);
+        if (g_pUtils)
+            g_pUtils->ErrorLog("[%s] Failed to load config", g_PLAPI->GetLogTag());
         return false;
     }
 
     Config c;
+
     // Core
     c.enabled      = pKV->GetBool("enabled", true);
     c.debugMode    = pKV->GetBool("debug_mode", false);
@@ -433,11 +614,16 @@ static bool LoadConfig()
     c.pointDecay         = pKV->GetInt("point_decay", 10);
     c.decayInterval      = pKV->GetFloat("decay_interval", 30.0f);
 
+    // Punishment
+    c.punishType    = pKV->GetInt("punish_type", 0);
+    c.punishCommand = pKV->GetString("punish_command", "");
+    c.chatMessage   = pKV->GetString("chat_message", "");
+
     // RayTrace
     c.raytraceRequired  = pKV->GetBool("raytrace_required", true);
     c.raytraceDebugBeam = pKV->GetBool("raytrace_debug_beam", false);
 
-    // WH tracking
+    // Hidden-target tracking
     c.whEnabled          = pKV->GetBool("wh_detection_enabled", false);
     c.whDebugOnly        = pKV->GetBool("wh_debug_only", true);
     c.whCheckInterval    = pKV->GetFloat("wh_check_interval", 0.5f);
@@ -449,30 +635,77 @@ static bool LoadConfig()
     c.whViolationPoints  = pKV->GetInt("wh_violation_points", 25);
     c.whDotThreshold     = pKV->GetFloat("wh_dot_threshold", 0.995f);
 
-    // Legacy DLL detection
-    c.punishType    = pKV->GetInt("punish_type", 0);
-    c.punishCommand = pKV->GetString("punish_command", "");
-    c.chatMessage   = pKV->GetString("chat_message", "");
-    c.dllInterval   = pKV->GetFloat("interval", 5.0f);
+    // DLL detection
+    c.dllInterval = pKV->GetFloat("interval", 5.0f);
+
+    // Aim pattern
+    c.aimEnabled           = pKV->GetBool("aim_detection_enabled", true);
+    c.aimDebugOnly         = pKV->GetBool("aim_debug_only", true);
+    c.aimCheckInterval     = pKV->GetFloat("aim_check_interval", 0.25f);
+    c.aimMinSamples        = pKV->GetInt("aim_min_samples", 5);
+    c.aimSnapAngleThreshold = pKV->GetFloat("aim_snap_angle_threshold", 30.0f);
+    c.aimSnapDotThreshold  = pKV->GetFloat("aim_snap_dot_threshold", 0.96f);
+    c.aimCooldown          = pKV->GetFloat("aim_cooldown", 30.0f);
+    c.aimPoints            = pKV->GetInt("aim_points", 15);
+
+    // Trigger pattern
+    c.triggerEnabled       = pKV->GetBool("trigger_detection_enabled", true);
+    c.triggerDebugOnly     = pKV->GetBool("trigger_debug_only", true);
+    c.triggerMinSamples    = pKV->GetInt("trigger_min_samples", 5);
+    c.triggerMaxReactionSec = pKV->GetFloat("trigger_max_reaction_sec", 0.5f);
+    c.triggerCooldown      = pKV->GetFloat("trigger_cooldown", 30.0f);
+    c.triggerPoints        = pKV->GetInt("trigger_points", 15);
+
+    // Composite risk
+    c.compositeEnabled       = pKV->GetBool("composite_enabled", true);
+    c.compositeMinCategories = pKV->GetInt("composite_min_categories", 3);
+    c.compositeBonusPoints   = pKV->GetInt("composite_bonus_points", 50);
 
     // Logging
     c.logs    = pKV->GetBool("logs", true);
     c.logFile = pKV->GetString("log_file", "addons/AntiDLL/logs/antidll.log");
 
     // Discord
-    c.webhookEnabled   = pKV->GetBool("webhook_enabled", false);
-    c.webhookUrl       = pKV->GetString("webhook_url", "");
-    c.webhookMinPoints = pKV->GetInt("webhook_min_points", 25);
+    c.webhookEnabled     = pKV->GetBool("webhook_enabled", false);
+    c.webhookUrl         = pKV->GetString("webhook_url", "");
+    c.webhookMinPoints   = pKV->GetInt("webhook_min_points", 25);
+    c.webhookPluginLoad  = pKV->GetBool("webhook_plugin_load", true);
+    c.webhookViolations  = pKV->GetBool("webhook_violations", true);
+    c.webhookPunishments = pKV->GetBool("webhook_punishments", true);
 
-    // --- Safety clamps ---
-    if (c.whCheckInterval    < 0.25f) c.whCheckInterval = 0.25f;
-    if (c.whTrackingThreshold < 2.0f) c.whTrackingThreshold = 2.0f;
-    if (c.whDotThreshold     < 0.98f) c.whDotThreshold = 0.98f;
-    if (c.whViolationPoints  > 50)    c.whViolationPoints = 50;
-    if (c.violationThreshold < 100)   c.violationThreshold = 100;
-    if (c.whCooldown         < 5.0f)  c.whCooldown = 5.0f;
-    if (c.decayInterval      < 1.0f)  c.decayInterval = 1.0f;
-    if (c.whMinSamples       < 1)     c.whMinSamples = 1;
+    // Server identity
+    c.serverPublicIp          = pKV->GetString("server_public_ip", "");
+    c.serverPort              = pKV->GetInt("server_port", 0);
+    c.serverNameFallback      = pKV->GetString("server_name_fallback", "Unknown Server");
+    c.identityRefreshInterval = pKV->GetFloat("server_identity_refresh_interval", 300.0f);
+
+    // MySQL
+    c.mysql.enabled        = pKV->GetBool("mysql_enabled", false);
+    c.mysql.host           = pKV->GetString("mysql_host", "127.0.0.1");
+    c.mysql.port           = pKV->GetInt("mysql_port", 3306);
+    c.mysql.user           = pKV->GetString("mysql_user", "root");
+    c.mysql.password       = pKV->GetString("mysql_password", "");
+    c.mysql.database       = pKV->GetString("mysql_database", "antidll");
+    c.mysql.serverTable    = pKV->GetString("mysql_server_table", "antidll_servers");
+    c.mysql.detectionTable = pKV->GetString("mysql_detection_table", "antidll_detections");
+
+    // Safety clamps
+    if (c.whCheckInterval     < 0.25f) c.whCheckInterval = 0.25f;
+    if (c.whTrackingThreshold < 2.0f)  c.whTrackingThreshold = 2.0f;
+    if (c.whDotThreshold      < 0.98f) c.whDotThreshold = 0.98f;
+    if (c.whViolationPoints   > 50)    c.whViolationPoints = 50;
+    if (c.violationThreshold  < 100)   c.violationThreshold = 100;
+    if (c.whCooldown          < 5.0f)  c.whCooldown = 5.0f;
+    if (c.decayInterval       < 1.0f)  c.decayInterval = 1.0f;
+    if (c.whMinSamples        < 1)     c.whMinSamples = 1;
+    if (c.aimCheckInterval    < 0.1f)  c.aimCheckInterval = 0.1f;
+    if (c.aimMinSamples       < 2)     c.aimMinSamples = 2;
+    if (c.aimSnapAngleThreshold < 5.0f) c.aimSnapAngleThreshold = 5.0f;
+    if (c.aimPoints           > 50)    c.aimPoints = 50;
+    if (c.triggerMinSamples   < 2)     c.triggerMinSamples = 2;
+    if (c.triggerPoints       > 50)    c.triggerPoints = 50;
+    if (c.compositeBonusPoints > 100)  c.compositeBonusPoints = 100;
+    if (c.identityRefreshInterval < 30.0f) c.identityRefreshInterval = 30.0f;
 
     g_Cfg = c;
     RayTrace_SetDebugBeam(g_Cfg.raytraceDebugBeam);
@@ -480,7 +713,7 @@ static bool LoadConfig()
 }
 
 //==============================================================================
-// ViolationManager
+// Violation manager
 //==============================================================================
 
 static void ReplaceString(std::string& str, const std::string& from, const std::string& to)
@@ -500,9 +733,16 @@ static void Punish(int slot, uint64 steamId, const std::string& reason)
     g_SMAPI->Format(szSteamID64, sizeof(szSteamID64), "%llu", steamId);
 
     LogStructured(std::string("action=PUNISH player=") + szName + " steamid=" + szSteamID64 + " reason=\"" + reason + "\"");
-    WebhookSend("1sT-AntiDLL — punishment executed",
-        std::string("**Player:** ") + szName + "\\n**SteamID64:** " + szSteamID64 + "\\n**Reason:** " + reason,
-        0xFF0000);
+
+    if (g_Cfg.webhookPunishments)
+    {
+        auto fields = BuildServerFields();
+        fields.push_back({"Player", szName, true});
+        fields.push_back({"SteamID64", szSteamID64, true});
+        fields.push_back({"Reason", reason, false});
+        fields.push_back({"Action", g_Cfg.punishType ? "ban" : "kick", true});
+        WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 punishment executed", fields, 0xFF0000);
+    }
 
     if (!g_Cfg.chatMessage.empty())
     {
@@ -527,8 +767,8 @@ static void Punish(int slot, uint64 steamId, const std::string& reason)
     }
 }
 
-// Adds violation points and punishes only if the running total crosses the threshold.
-static void AddViolation(int slot, uint64 steamId, int points, const std::string& reason)
+static void AddViolation(int slot, uint64 steamId, int points, const std::string& reason,
+                          DetCategory category, const std::string& evidenceJson = "")
 {
     bool doPunish = false;
     int before = 0, after = 0;
@@ -543,6 +783,7 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
         st.lastViolationTime = gpGlobals ? gpGlobals->curtime : 0.0;
         st.history.push_back(reason);
         if (st.history.size() > 16) st.history.erase(st.history.begin());
+        if (category < DET_COUNT) st.evidenceCount[category]++;
 
         if (st.points >= g_Cfg.violationThreshold && !st.punished)
         {
@@ -551,25 +792,51 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
         }
     }
 
+    const char* szName = g_pPlayers->GetPlayerName(slot);
     char szSteamID64[64];
     g_SMAPI->Format(szSteamID64, sizeof(szSteamID64), "%llu", steamId);
-    LogStructured(std::string("type=VIOLATION player=") + g_pPlayers->GetPlayerName(slot) +
-        " steamid=" + szSteamID64 + " reason=\"" + reason + "\"" +
-        " points_before=" + std::to_string(before) + " points_after=" + std::to_string(after));
 
-    if (points >= g_Cfg.webhookMinPoints)
-        WebhookSend("1sT-AntiDLL — violation",
-            std::string("**Player:** ") + g_pPlayers->GetPlayerName(slot) + "\\n**SteamID64:** " + szSteamID64 +
-            "\\n**Reason:** " + reason + "\\n**Points:** " + std::to_string(after) + "/" + std::to_string(g_Cfg.violationThreshold),
-            0xF1C40F);
+    LogStructured(std::string("type=VIOLATION category=") + DetCategoryStr(category) +
+        " player=" + szName + " steamid=" + szSteamID64 + " reason=\"" + reason + "\"" +
+        " points=" + std::to_string(after) + "/" + std::to_string(g_Cfg.violationThreshold));
+
+    // MySQL detection log
+    if (g_MySQL.IsConnected())
+    {
+        ServerIdentity sid = g_MySQL.GetIdentity();
+        std::string sql = "INSERT INTO " + g_Cfg.mysql.detectionTable +
+            " (server_name, server_group, region, server_ip, server_port, map_name,"
+            " player_name, steamid64, detection_category, detection_reason,"
+            " points_added, points_total, threshold, action_taken, evidence_json)"
+            " VALUES ('" + SqlEscape(sid.name) + "','" + SqlEscape(sid.group) + "','" +
+            SqlEscape(sid.region) + "','" + SqlEscape(sid.ip) + "'," +
+            std::to_string(sid.port) + ",'" + SqlEscape(g_MapName) + "','" +
+            SqlEscape(szName) + "','" + szSteamID64 + "','" +
+            SqlEscape(DetCategoryStr(category)) + "','" + SqlEscape(reason) + "'," +
+            std::to_string(points) + "," + std::to_string(after) + "," +
+            std::to_string(g_Cfg.violationThreshold) + ",'" +
+            (doPunish ? (g_Cfg.punishType ? "ban" : "kick") : "none") + "','" +
+            SqlEscape(evidenceJson) + "')";
+        g_MySQL.QueueSQL(sql);
+    }
+
+    // Webhook
+    if (g_Cfg.webhookViolations && points >= g_Cfg.webhookMinPoints)
+    {
+        auto fields = BuildServerFields();
+        fields.push_back({"Player",    szName,                        true});
+        fields.push_back({"SteamID64", szSteamID64,                   true});
+        fields.push_back({"Reason",    reason,                        false});
+        fields.push_back({"Category",  DetCategoryStr(category),       true});
+        fields.push_back({"Points",    std::to_string(after) + "/" + std::to_string(g_Cfg.violationThreshold), true});
+        fields.push_back({"Action",    doPunish ? (g_Cfg.punishType ? "ban" : "kick") : "none", true});
+        if (!evidenceJson.empty())
+            fields.push_back({"Evidence", evidenceJson, false});
+        WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 violation", fields, 0xF1C40F);
+    }
 
     if (doPunish)
-    {
-        WebhookSend("1sT-AntiDLL — threshold reached",
-            std::string("**Player:** ") + g_pPlayers->GetPlayerName(slot) + " reached " + std::to_string(after) + " points",
-            0xFF0000);
         Punish(slot, steamId, reason);
-    }
 }
 
 static void DecayPoints()
@@ -580,7 +847,7 @@ static void DecayPoints()
         PlayerState& st = it->second;
         if (st.punished) { ++it; continue; }
         st.points = std::max(0, st.points - g_Cfg.pointDecay);
-        if (st.points == 0 && st.whTargetSlot < 0)
+        if (st.points == 0 && st.whTargetSlot < 0 && st.aimSnapEvidence == 0 && st.triggerEvidence == 0)
             it = g_States.erase(it);
         else
             ++it;
@@ -588,10 +855,9 @@ static void DecayPoints()
 }
 
 //==============================================================================
-// DetectionManager — legacy DLL probe (unchanged behavior) + hidden-target tracking
+// Detection: legacy DLL event-listener probe
 //==============================================================================
 
-// Original event-listener DLL detection. Kept intact; only the points routing changed.
 static void RunDllDetection()
 {
     for (int i = 0; i < 64; i++)
@@ -612,18 +878,25 @@ static void RunDllDetection()
         {
             if (g_pUtils->GetGameEventManager()->FindListener(pListener, ev.c_str()))
             {
-                AddViolation(i, steamId, g_Cfg.pointsPerDetection, std::string("Illegal event listener: ") + ev);
+                std::string evidence = "{\"event\":\"" + ev + "\"}";
+                AddViolation(i, steamId, g_Cfg.pointsPerDetection,
+                    std::string("Illegal event listener: ") + ev, DET_DLL_EVENT, evidence);
                 break;
             }
         }
     }
 }
 
-// SuspiciousAngleTracker + RayTraceVisibility: evidence-based hidden-target tracking.
+//==============================================================================
+// Detection: hidden-target tracking (evidence-based)
+//==============================================================================
+
 static void RunHiddenTargetTracking()
 {
     if (!g_Cfg.whEnabled) return;
     if (!gpGlobals) return;
+    if (IsWarmupPeriod() || IsFreezePeriod() || !g_RoundActive) return;
+
     double now = gpGlobals->curtime;
 
     for (int i = 0; i < 64; i++)
@@ -657,7 +930,7 @@ static void RunHiddenTargetTracking()
             if (targetTeam == myTeam || targetTeam <= 1) continue;
 
             Vector tpos = GetPlayerPosition(j);
-            tpos.z += 52.0f; // chest
+            tpos.z += 52.0f;
             Vector delta = VecSub(tpos, eye);
             float dist = VecLength(delta);
             if (dist > g_Cfg.whMaxDistance || dist < 1.0f) continue;
@@ -673,20 +946,17 @@ static void RunHiddenTargetTracking()
 
         PlayerState& st = StateFor(i);
 
-        // Expire stale tracking if too long since the last positive sample.
         if (st.whTargetSlot >= 0 && (now - st.whLastSample) > g_Cfg.whResetGap)
         {
             st.whTargetSlot = -1;
             st.whSampleCount = 0;
         }
 
-        // No candidate inside the crosshair cone -> nothing to evaluate.
         if (bestTarget < 0 || bestDot < g_Cfg.whDotThreshold)
             continue;
 
-        // Step 2: visibility check.
         if (g_Cfg.raytraceRequired && !RayTrace_IsAvailable())
-            continue; // cannot verify visibility -> never flag (fail-safe)
+            continue;
 
         if (RayTrace_IsAvailable())
         {
@@ -701,13 +971,9 @@ static void RunHiddenTargetTracking()
                 continue;
             }
         }
-        // Without Ray-Trace (and raytrace_required=0): angle-only mode.
 
-        // Step 3: hidden target under the crosshair — accumulate evidence.
         if (st.whTargetSlot == bestTarget)
-        {
             st.whSampleCount++;
-        }
         else
         {
             st.whTargetSlot = bestTarget;
@@ -720,7 +986,6 @@ static void RunHiddenTargetTracking()
         if (duration < g_Cfg.whTrackingThreshold || st.whSampleCount < g_Cfg.whMinSamples)
             continue;
 
-        // Cooldown between evidence events for the same player.
         if (now - st.whLastViolationTime < g_Cfg.whCooldown)
             continue;
         st.whLastViolationTime = now;
@@ -731,38 +996,334 @@ static void RunHiddenTargetTracking()
         g_SMAPI->Format(szSteamID64, sizeof(szSteamID64), "%llu", steamId);
         g_SMAPI->Format(szTargetSteamID64, sizeof(szTargetSteamID64), "%llu", g_pPlayers->GetSteamID64(bestTarget));
 
-        const std::string reason = "Suspicious hidden-target angle tracking";
         const char* visMode = RayTrace_IsAvailable() ? "raytrace" : "angle_only";
-        LogStructured(std::string("type=SUSPICION map=") + GetMapName() + " server=" + GetServerName() +
-            " player=" + szName + " steamid=" + szSteamID64 +
-            " target=" + szTargetName + " target_steamid=" + szTargetSteamID64 +
-            " dot=" + std::to_string(bestDot) + " distance=" + std::to_string(bestDist) +
-            " visibility=" + visMode + " samples=" + std::to_string(st.whSampleCount) +
-            " duration=" + std::to_string(duration) +
-            " mode=" + (g_Cfg.whDebugOnly ? "debug_only" : "enforce"));
+        std::string evidence = "{\"dot\":" + std::to_string(bestDot) +
+            ",\"distance\":" + std::to_string(bestDist) +
+            ",\"samples\":" + std::to_string(st.whSampleCount) +
+            ",\"duration\":" + std::to_string(duration) +
+            ",\"target\":\"" + szTargetName +
+            "\",\"target_steamid64\":\"" + szTargetSteamID64 +
+            "\",\"visibility\":\"" + visMode + "\"}";
 
-        // Reset the tracking window so we gather fresh evidence next time.
         st.whTargetSlot = -1;
         st.whSampleCount = 0;
 
+        const std::string reason = "Suspicious hidden-target angle tracking";
+
+        LogStructured(std::string("type=SUSPICION category=") + DetCategoryStr(DET_HIDDEN_TARGET) +
+            " player=" + szName + " steamid=" + szSteamID64 +
+            " target=" + szTargetName + " dot=" + std::to_string(bestDot) +
+            " distance=" + std::to_string(bestDist) + " samples=" + std::to_string(st.whSampleCount) +
+            " duration=" + std::to_string(duration) +
+            " mode=" + (g_Cfg.whDebugOnly ? "debug_only" : "enforce"));
+
         if (g_Cfg.whDebugOnly)
         {
-            // Debug-only: never punish. Log + optional webhook for review.
-            WebhookSend("1sT-AntiDLL — hidden target tracking evidence",
-                std::string("**Player:** ") + szName + "\\n**SteamID64:** " + szSteamID64 +
-                "\\n**Target:** " + szTargetName + "\\n**Dot:** " + std::to_string(bestDot) +
-                "\\n**Distance:** " + std::to_string(bestDist) + "\\n*(debug_only — no punishment)*",
-                0x3498DB);
+            auto fields = BuildServerFields();
+            fields.push_back({"Player",    szName,       true});
+            fields.push_back({"SteamID64", szSteamID64,  true});
+            fields.push_back({"Target",    szTargetName,  true});
+            fields.push_back({"Dot",       std::to_string(bestDot),  true});
+            fields.push_back({"Distance",  std::to_string((int)bestDist) + "u", true});
+            fields.push_back({"Mode",      "debug_only (no punishment)", false});
+            WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 hidden target evidence", fields, 0x3498DB);
         }
         else
         {
-            AddViolation(i, steamId, g_Cfg.whViolationPoints, reason);
+            AddViolation(i, steamId, g_Cfg.whViolationPoints, reason, DET_HIDDEN_TARGET, evidence);
         }
     }
 }
 
 //==============================================================================
-// AdminCommands — native ConCommands (server console / rcon)
+// Detection: aim snap pattern (evidence-based)
+//==============================================================================
+
+static void RunAimPatternDetection()
+{
+    if (!g_Cfg.aimEnabled) return;
+    if (!gpGlobals) return;
+    if (IsWarmupPeriod() || IsFreezePeriod() || !g_RoundActive) return;
+
+    double now = gpGlobals->curtime;
+
+    for (int i = 0; i < 64; i++)
+    {
+        if (!IsValidHumanPlayer(i)) continue;
+        if (!IsPlayerAlive(i)) continue;
+        uint64 steamId = g_pPlayers->GetSteamID64(i);
+
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            auto it = g_States.find(i);
+            if (it != g_States.end() && it->second.punished) continue;
+        }
+
+        QAngle curAngles = GetPlayerEyeAngles(i);
+        int curShots = GetPlayerShotsFired(i);
+
+        PlayerState& st = StateFor(i);
+
+        if (!st.hasPrevAngles)
+        {
+            st.prevAngles = curAngles;
+            st.prevAngleTime = now;
+            st.prevShotsFired = curShots;
+            st.hasPrevAngles = true;
+            continue;
+        }
+
+        float delta = AngleDelta(curAngles, st.prevAngles);
+        bool firedShots = (curShots > st.prevShotsFired) && (curShots > 0);
+
+        st.prevAngles = curAngles;
+        st.prevAngleTime = now;
+        st.prevShotsFired = curShots;
+
+        if (delta < g_Cfg.aimSnapAngleThreshold || !firedShots)
+            continue;
+
+        Vector eye = GetPlayerEyePosition(i);
+        Vector forward = AnglesToForward(curAngles);
+        int myTeam = GetPlayerTeam(i);
+        if (IsZeroVector(eye) || myTeam <= 1) continue;
+
+        bool snapToEnemy = false;
+        float snapDot = 0.0f;
+        float snapDist = 0.0f;
+        for (int j = 0; j < 64; j++)
+        {
+            if (i == j) continue;
+            if (!IsValidHumanPlayer(j)) continue;
+            if (!IsPlayerAlive(j)) continue;
+
+            int targetTeam = GetPlayerTeam(j);
+            if (targetTeam == myTeam || targetTeam <= 1) continue;
+
+            Vector tpos = GetPlayerPosition(j);
+            tpos.z += 52.0f;
+            Vector d = VecSub(tpos, eye);
+            float dist = VecLength(d);
+            if (dist < 100.0f || dist > g_Cfg.whMaxDistance) continue;
+
+            float dot = VecDot(forward, VecNormalize(d));
+            if (dot > g_Cfg.aimSnapDotThreshold)
+            {
+                snapToEnemy = true;
+                snapDot = dot;
+                snapDist = dist;
+                break;
+            }
+        }
+
+        if (!snapToEnemy) continue;
+
+        st.aimSnapEvidence++;
+
+        if (st.aimSnapEvidence < g_Cfg.aimMinSamples)
+            continue;
+        if (now - st.aimLastViolationTime < g_Cfg.aimCooldown)
+            continue;
+        st.aimLastViolationTime = now;
+        int evidenceCount = st.aimSnapEvidence;
+        st.aimSnapEvidence = 0;
+
+        const char* szName = g_pPlayers->GetPlayerName(i);
+        char szSteamID64[64];
+        g_SMAPI->Format(szSteamID64, sizeof(szSteamID64), "%llu", steamId);
+
+        std::string evidence = "{\"snap_angle\":" + std::to_string(delta) +
+            ",\"dot\":" + std::to_string(snapDot) +
+            ",\"distance\":" + std::to_string(snapDist) +
+            ",\"evidence_count\":" + std::to_string(evidenceCount) + "}";
+
+        const std::string reason = "Suspicious snap aim pattern";
+
+        LogStructured(std::string("type=SUSPICION category=") + DetCategoryStr(DET_AIM_SNAP) +
+            " player=" + szName + " steamid=" + szSteamID64 +
+            " snap_angle=" + std::to_string(delta) + " dot=" + std::to_string(snapDot) +
+            " evidence=" + std::to_string(evidenceCount) +
+            " mode=" + (g_Cfg.aimDebugOnly ? "debug_only" : "enforce"));
+
+        if (g_Cfg.aimDebugOnly)
+        {
+            auto fields = BuildServerFields();
+            fields.push_back({"Player",     szName,       true});
+            fields.push_back({"SteamID64",  szSteamID64,  true});
+            fields.push_back({"Snap Angle", std::to_string((int)delta) + "\xc2\xb0", true});
+            fields.push_back({"Evidence",   std::to_string(evidenceCount) + " snaps", true});
+            fields.push_back({"Mode",       "debug_only (no punishment)", false});
+            WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 aim snap evidence", fields, 0x9B59B6);
+        }
+        else
+        {
+            AddViolation(i, steamId, g_Cfg.aimPoints, reason, DET_AIM_SNAP, evidence);
+        }
+    }
+}
+
+//==============================================================================
+// Detection: triggerbot reaction pattern (evidence-based, requires RayTrace)
+//==============================================================================
+
+static void RunTriggerDetection()
+{
+    if (!g_Cfg.triggerEnabled) return;
+    if (!RayTrace_IsAvailable()) return;
+    if (!gpGlobals) return;
+    if (IsWarmupPeriod() || IsFreezePeriod() || !g_RoundActive) return;
+
+    double now = gpGlobals->curtime;
+
+    for (int i = 0; i < 64; i++)
+    {
+        if (!IsValidHumanPlayer(i)) continue;
+        if (!IsPlayerAlive(i)) continue;
+        uint64 steamId = g_pPlayers->GetSteamID64(i);
+
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            auto it = g_States.find(i);
+            if (it != g_States.end() && it->second.punished) continue;
+        }
+
+        int myTeam = GetPlayerTeam(i);
+        if (myTeam <= 1) continue;
+
+        int curShots = GetPlayerShotsFired(i);
+        PlayerState& st = StateFor(i);
+        bool firedThisTick = (curShots > st.triggerPrevShotsFired) && (curShots > 0);
+        st.triggerPrevShotsFired = curShots;
+
+        for (int j = 0; j < 64; j++)
+        {
+            if (i == j) continue;
+            if (!IsValidHumanPlayer(j)) continue;
+            if (!IsPlayerAlive(j)) continue;
+
+            int targetTeam = GetPlayerTeam(j);
+            if (targetTeam == myTeam || targetTeam <= 1) continue;
+
+            Vector tpos = GetPlayerPosition(j);
+            Vector eye = GetPlayerEyePosition(i);
+            if (IsZeroVector(tpos) || IsZeroVector(eye)) continue;
+
+            float dist = VecLength(VecSub(tpos, eye));
+            if (dist < 100.0f || dist > g_Cfg.whMaxDistance) continue;
+
+            bool visibleNow = IsEnemyVisibleByRayTrace(i, j);
+
+            auto& tv = st.targetVis[j];
+            if (visibleNow && !tv.wasVisible)
+            {
+                tv.changeTime = now;
+            }
+
+            if (firedThisTick && visibleNow && tv.changeTime > 0.0)
+            {
+                double reaction = now - tv.changeTime;
+                if (reaction > 0.0 && reaction <= g_Cfg.triggerMaxReactionSec)
+                {
+                    st.triggerEvidence++;
+                    tv.changeTime = 0.0;
+                }
+            }
+
+            tv.wasVisible = visibleNow;
+        }
+
+        if (st.triggerEvidence < g_Cfg.triggerMinSamples)
+            continue;
+        if (now - st.triggerLastViolationTime < g_Cfg.triggerCooldown)
+            continue;
+        st.triggerLastViolationTime = now;
+        int evidenceCount = st.triggerEvidence;
+        st.triggerEvidence = 0;
+
+        const char* szName = g_pPlayers->GetPlayerName(i);
+        char szSteamID64[64];
+        g_SMAPI->Format(szSteamID64, sizeof(szSteamID64), "%llu", steamId);
+
+        std::string evidence = "{\"trigger_events\":" + std::to_string(evidenceCount) + "}";
+        const std::string reason = "Suspicious triggerbot-like reaction pattern";
+
+        LogStructured(std::string("type=SUSPICION category=") + DetCategoryStr(DET_TRIGGER) +
+            " player=" + szName + " steamid=" + szSteamID64 +
+            " evidence=" + std::to_string(evidenceCount) +
+            " mode=" + (g_Cfg.triggerDebugOnly ? "debug_only" : "enforce"));
+
+        if (g_Cfg.triggerDebugOnly)
+        {
+            auto fields = BuildServerFields();
+            fields.push_back({"Player",    szName,       true});
+            fields.push_back({"SteamID64", szSteamID64,  true});
+            fields.push_back({"Events",    std::to_string(evidenceCount) + " trigger-like reactions", true});
+            fields.push_back({"Mode",      "debug_only (no punishment)", false});
+            WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 trigger pattern evidence", fields, 0xE91E63);
+        }
+        else
+        {
+            AddViolation(i, steamId, g_Cfg.triggerPoints, reason, DET_TRIGGER, evidence);
+        }
+    }
+}
+
+//==============================================================================
+// Detection: composite risk scoring
+//==============================================================================
+
+// Composite risk: finds players with evidence in multiple categories and adds bonus violation points.
+static void ProcessCompositeViolations()
+{
+    if (!g_Cfg.compositeEnabled) return;
+    if (!gpGlobals) return;
+
+    struct Pending { int slot; uint64 steamId; std::string evidence; };
+    std::vector<Pending> pending;
+
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        for (auto& kv : g_States)
+        {
+            int slot = kv.first;
+            PlayerState& st = kv.second;
+            if (st.punished) continue;
+            if (!IsValidHumanPlayer(slot)) continue;
+
+            int categoriesWithEvidence = 0;
+            for (int c = 0; c < DET_COUNT; c++)
+            {
+                if (c == DET_COMPOSITE) continue;
+                if (st.evidenceCount[c] > 0) categoriesWithEvidence++;
+            }
+
+            if (categoriesWithEvidence < g_Cfg.compositeMinCategories)
+                continue;
+
+            std::string evidence = "{\"categories\":" + std::to_string(categoriesWithEvidence) +
+                ",\"dll\":" + std::to_string(st.evidenceCount[DET_DLL_EVENT]) +
+                ",\"hidden_target\":" + std::to_string(st.evidenceCount[DET_HIDDEN_TARGET]) +
+                ",\"aim_snap\":" + std::to_string(st.evidenceCount[DET_AIM_SNAP]) +
+                ",\"trigger\":" + std::to_string(st.evidenceCount[DET_TRIGGER]) + "}";
+
+            pending.push_back({slot, st.steamId, evidence});
+
+            for (int c = 0; c < DET_COUNT; c++)
+            {
+                if (c != DET_COMPOSITE) st.evidenceCount[c] = 0;
+            }
+        }
+    }
+
+    for (auto& p : pending)
+    {
+        AddViolation(p.slot, p.steamId, g_Cfg.compositeBonusPoints,
+            "Composite risk: multiple detection categories triggered", DET_COMPOSITE, p.evidence);
+    }
+}
+
+//==============================================================================
+// Admin commands — native ConCommands (server console / rcon)
 //==============================================================================
 
 CON_COMMAND_F(antidll_reload, "Reload 1sT-AntiDLL config and events", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
@@ -775,13 +1336,25 @@ CON_COMMAND_F(antidll_reload, "Reload 1sT-AntiDLL config and events", FCVAR_GAME
 CON_COMMAND_F(antidll_status, "Show 1sT-AntiDLL status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
     std::lock_guard<std::mutex> lock(g_StateMutex);
-    META_CONPRINTF("[1sT-AntiDLL] enabled=%d wh=%d debug_only=%d raytrace=%d raytrace_required=%d vis_mode=%s tracked=%zu\n",
-        g_Cfg.enabled, g_Cfg.whEnabled, g_Cfg.whDebugOnly, RayTrace_IsAvailable(), g_Cfg.raytraceRequired,
-        RayTrace_IsAvailable() ? "raytrace" : (g_Cfg.raytraceRequired ? "disabled" : "angle_only"),
-        g_States.size());
+    META_CONPRINTF("[1sT-AntiDLL] v%s\n", g_AntiDLL.GetVersion());
+    META_CONPRINTF("  Server: %s (%s)\n", GetServerDisplayName().c_str(), GetServerAddress().c_str());
+    META_CONPRINTF("  Map: %s  Players: %s\n", g_MapName.c_str(), GetPlayerCountStr().c_str());
+    META_CONPRINTF("  MySQL: %s  RayTrace: %s\n",
+        g_MySQL.IsConnected() ? "connected" : (g_MySQL.IsLoaded() ? "loaded" : "disabled"),
+        RayTrace_IsAvailable() ? "loaded" : "missing");
+    META_CONPRINTF("  DLL Detection: on  WH Detection: %s  Aim: %s  Trigger: %s\n",
+        g_Cfg.whEnabled ? "on" : "off",
+        g_Cfg.aimEnabled ? "on" : "off",
+        g_Cfg.triggerEnabled ? "on" : "off");
+    META_CONPRINTF("  Debug-only: wh=%d aim=%d trigger=%d\n",
+        g_Cfg.whDebugOnly, g_Cfg.aimDebugOnly, g_Cfg.triggerDebugOnly);
+    META_CONPRINTF("  Webhook: %s  Queue running: %d\n",
+        g_Cfg.webhookEnabled ? "on" : "off", g_Webhook.IsRunning());
+    META_CONPRINTF("  Violation threshold: %d  Tracked players: %zu\n",
+        g_Cfg.violationThreshold, g_States.size());
 }
 
-CON_COMMAND_F(antidll_player, "Show 1sT-AntiDLL player state: antidll_player <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+CON_COMMAND_F(antidll_player, "Show player state: antidll_player <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
     if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] usage: antidll_player <slot>\n"); return; }
     int target = atoi(args[1]);
@@ -793,11 +1366,17 @@ CON_COMMAND_F(antidll_player, "Show 1sT-AntiDLL player state: antidll_player <sl
         return;
     }
     const PlayerState& st = it->second;
-    META_CONPRINTF("[1sT-AntiDLL] slot=%d name=%s points=%d punished=%d history=%zu\n",
-        target, st.name.c_str(), st.points, st.punished, st.history.size());
+    META_CONPRINTF("[1sT-AntiDLL] slot=%d name=%s steamid=%llu points=%d/%d punished=%d\n",
+        target, st.name.c_str(), st.steamId, st.points, g_Cfg.violationThreshold, st.punished);
+    META_CONPRINTF("  Evidence: dll=%d wh=%d aim=%d trigger=%d composite=%d\n",
+        st.evidenceCount[DET_DLL_EVENT], st.evidenceCount[DET_HIDDEN_TARGET],
+        st.evidenceCount[DET_AIM_SNAP], st.evidenceCount[DET_TRIGGER],
+        st.evidenceCount[DET_COMPOSITE]);
+    META_CONPRINTF("  WH tracking: target=%d samples=%d  Aim snaps: %d  Trigger events: %d\n",
+        st.whTargetSlot, st.whSampleCount, st.aimSnapEvidence, st.triggerEvidence);
 }
 
-CON_COMMAND_F(antidll_reset, "Reset 1sT-AntiDLL player state: antidll_reset <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+CON_COMMAND_F(antidll_reset, "Reset player state: antidll_reset <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
     if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] usage: antidll_reset <slot>\n"); return; }
     int target = atoi(args[1]);
@@ -807,15 +1386,44 @@ CON_COMMAND_F(antidll_reset, "Reset 1sT-AntiDLL player state: antidll_reset <slo
 
 CON_COMMAND_F(antidll_test_webhook, "Queue a test Discord webhook", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
-    WebhookSend("1sT-AntiDLL \xe2\x80\x94 test", "Test webhook from antidll_test_webhook", 0x2ECC71);
+    auto fields = BuildServerFields();
+    fields.push_back({"Version", g_AntiDLL.GetVersion(), true});
+    fields.push_back({"Test", "antidll_test_webhook", true});
+    WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 test", fields, 0x2ECC71);
     META_CONPRINTF("[1sT-AntiDLL] test webhook queued (enabled=%d)\n", g_Cfg.webhookEnabled);
 }
 
-CON_COMMAND_F(antidll_debug, "Toggle 1sT-AntiDLL debug mode: antidll_debug <0|1>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+CON_COMMAND_F(antidll_debug, "Toggle debug mode: antidll_debug <0|1>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
     if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] debug_mode=%d\n", g_Cfg.debugMode); return; }
     g_Cfg.debugMode = (atoi(args[1]) != 0);
     META_CONPRINTF("[1sT-AntiDLL] debug_mode=%d\n", g_Cfg.debugMode);
+}
+
+CON_COMMAND_F(antidll_server_identity, "Show server identity info", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    META_CONPRINTF("[1sT-AntiDLL] Server Identity:\n");
+    META_CONPRINTF("  Name: %s\n", GetServerDisplayName().c_str());
+    META_CONPRINTF("  Address: %s\n", GetServerAddress().c_str());
+    if (g_MySQL.IsConnected())
+    {
+        ServerIdentity id = g_MySQL.GetIdentity();
+        META_CONPRINTF("  MySQL resolved: %s\n", id.resolved ? "yes" : "no");
+        META_CONPRINTF("  Group: %s  Region: %s\n", id.group.c_str(), id.region.c_str());
+    }
+    else
+    {
+        META_CONPRINTF("  MySQL: not connected (using fallback)\n");
+    }
+}
+
+CON_COMMAND_F(antidll_mysql_status, "Show MySQL connection status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    META_CONPRINTF("[1sT-AntiDLL] MySQL:\n");
+    META_CONPRINTF("  Enabled: %d\n", g_Cfg.mysql.enabled);
+    META_CONPRINTF("  Library loaded: %d\n", g_MySQL.IsLoaded());
+    META_CONPRINTF("  Connected: %d\n", g_MySQL.IsConnected());
+    META_CONPRINTF("  Host: %s:%d  DB: %s\n", g_Cfg.mysql.host.c_str(), g_Cfg.mysql.port, g_Cfg.mysql.database.c_str());
 }
 
 //==============================================================================
@@ -824,7 +1432,7 @@ CON_COMMAND_F(antidll_debug, "Toggle 1sT-AntiDLL debug mode: antidll_debug <0|1>
 
 static void OnClientAuth(int slot, uint64 steamId)
 {
-    ResetPlayer(slot); // clean slate on (re)connect
+    ResetPlayer(slot);
 }
 
 bool AntiDLL::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool late)
@@ -843,6 +1451,7 @@ bool AntiDLL::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool 
 bool AntiDLL::Unload(char* error, size_t maxlen)
 {
     g_Webhook.Stop();
+    g_MySQL.Stop();
     ConVar_Unregister();
     return true;
 }
@@ -871,48 +1480,140 @@ void AntiDLL::AllPluginsLoaded()
         return;
     }
 
-    // Make sure the log directory exists (best-effort, once).
     if (FILE* mk = popen("mkdir -p addons/AntiDLL/logs", "r"))
         pclose(mk);
 
     LoadEventFile();
     LoadConfig();
 
-    // Ray-Trace is optional; if missing, hidden-target visibility stays disabled.
+    // Ray-Trace (optional)
     if (!RayTrace_Load())
-        WebhookSend("1sT-AntiDLL — Ray-Trace missing", "Hidden-target visibility checks are disabled.", 0xE67E22);
+    {
+        if (g_Cfg.webhookEnabled)
+            WebhookSend("1sT-AntiDLL \xe2\x80\x94 Ray-Trace missing",
+                "Hidden-target visibility checks and trigger detection are disabled.", 0xE67E22);
+    }
 
+    // MySQL (optional)
+    if (g_Cfg.mysql.enabled)
+    {
+        if (g_MySQL.Init(g_Cfg.mysql))
+        {
+            g_MySQL.RequestIdentityRefresh(
+                g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp,
+                g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015,
+                g_Cfg.serverNameFallback);
+        }
+    }
+
+    // Webhook
     if (g_Cfg.webhookEnabled && !g_Cfg.webhookUrl.empty())
         g_Webhook.Start(g_Cfg.webhookUrl);
 
     g_pPlayers->HookOnClientAuthorized(g_PLID, OnClientAuth);
     g_pUtils->StartupServer(g_PLID, StartupServer);
 
-    WebhookSend("1sT-AntiDLL — plugin loaded",
-        std::string("Version ") + GetVersion() + " loaded. wh_detection=" +
-        (g_Cfg.whEnabled ? "on" : "off") + ", debug_only=" + (g_Cfg.whDebugOnly ? "on" : "off"),
-        0x2ECC71);
+    // Round state hooks
+    g_pUtils->HookEvent(g_PLID, "round_start", [](const char*, IGameEvent*, bool) {
+        g_RoundActive = true;
+    });
+    g_pUtils->HookEvent(g_PLID, "round_end", [](const char*, IGameEvent*, bool) {
+        g_RoundActive = false;
+    });
 
-    // Point decay timer.
+    // Plugin loaded webhook
+    if (g_Cfg.webhookPluginLoad)
+    {
+        std::vector<WebhookField> fields = {
+            {"Server",       GetServerDisplayName(),    true},
+            {"Address",      GetServerAddress(),         true},
+            {"Map",          g_MapName,                  true},
+            {"Players",      GetPlayerCountStr(),        true},
+            {"Version",      GetVersion(),               true},
+            {"RayTrace",     RayTrace_IsAvailable() ? "loaded" : "missing", true},
+            {"MySQL",        g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "connecting..." : "disabled"), true},
+            {"WH Detection", g_Cfg.whEnabled ? "on" : "off", true},
+            {"Aim Detection", g_Cfg.aimEnabled ? "on" : "off", true},
+            {"Trigger Detection", g_Cfg.triggerEnabled ? "on" : "off", true},
+            {"Debug Only",   (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "yes" : "no", true},
+            {"Punishment",   g_Cfg.punishType ? "ban" : "kick", true},
+            {"Threshold",    std::to_string(g_Cfg.violationThreshold), true},
+        };
+        WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
+    }
+
+    // Console startup message
+    META_CONPRINTF("============================================\n");
+    META_CONPRINTF("  1sT-AntiDLL v%s loaded\n", GetVersion());
+    META_CONPRINTF("  Server: %s (%s)\n", GetServerDisplayName().c_str(), GetServerAddress().c_str());
+    META_CONPRINTF("  MySQL: %s  RayTrace: %s\n",
+        g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "loading" : "disabled"),
+        RayTrace_IsAvailable() ? "loaded" : "missing");
+    META_CONPRINTF("  WH: %s  Aim: %s  Trigger: %s  Composite: %s\n",
+        g_Cfg.whEnabled ? "on" : "off", g_Cfg.aimEnabled ? "on" : "off",
+        g_Cfg.triggerEnabled ? "on" : "off", g_Cfg.compositeEnabled ? "on" : "off");
+    META_CONPRINTF("============================================\n");
+
+    // --- Timers ---
+
+    // Point decay
     g_pUtils->CreateTimer(g_Cfg.decayInterval, []() {
         DecayPoints();
         return g_Cfg.decayInterval;
     });
 
-    // Legacy DLL event-listener detection timer.
+    // DLL event-listener probe
     g_pUtils->CreateTimer(g_Cfg.dllInterval, []() {
         if (g_Cfg.enabled)
             RunDllDetection();
         return g_Cfg.dllInterval;
     });
 
-    // Hidden-target tracking timer.
+    // Hidden-target tracking
     if (g_Cfg.whEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.whCheckInterval, []() {
             if (g_Cfg.enabled)
                 RunHiddenTargetTracking();
             return g_Cfg.whCheckInterval;
+        });
+    }
+
+    // Aim + trigger pattern detection
+    if (g_Cfg.aimEnabled || g_Cfg.triggerEnabled)
+    {
+        g_pUtils->CreateTimer(g_Cfg.aimCheckInterval, []() {
+            if (g_Cfg.enabled)
+            {
+                RunAimPatternDetection();
+                RunTriggerDetection();
+            }
+            return g_Cfg.aimCheckInterval;
+        });
+    }
+
+    // Composite risk check (slower interval)
+    if (g_Cfg.compositeEnabled)
+    {
+        g_pUtils->CreateTimer(10.0f, []() {
+            if (g_Cfg.enabled)
+                ProcessCompositeViolations();
+            return 10.0f;
+        });
+    }
+
+    // MySQL server identity refresh
+    if (g_Cfg.mysql.enabled)
+    {
+        g_pUtils->CreateTimer(g_Cfg.identityRefreshInterval, []() {
+            if (g_MySQL.IsLoaded())
+            {
+                g_MySQL.RequestIdentityRefresh(
+                    g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp,
+                    g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015,
+                    g_Cfg.serverNameFallback);
+            }
+            return g_Cfg.identityRefreshInterval;
         });
     }
 }
@@ -922,10 +1623,10 @@ void AntiDLL::AllPluginsLoaded()
 //==============================================================================
 
 const char* AntiDLL::GetLicense()     { return "GPL"; }
-const char* AntiDLL::GetVersion()     { return "1.0.0"; }
+const char* AntiDLL::GetVersion()     { return "1.1.0"; }
 const char* AntiDLL::GetDate()        { return __DATE__; }
 const char* AntiDLL::GetLogTag()      { return "1sT-AntiDLL"; }
 const char* AntiDLL::GetAuthor()      { return "Snaximusss+"; }
-const char* AntiDLL::GetDescription() { return "1sT-AntiDLL - Anti-DLL injection & defensive hidden-target tracking for CS2"; }
+const char* AntiDLL::GetDescription() { return "1sT-AntiDLL - Anti-DLL injection & behavioral detection for CS2"; }
 const char* AntiDLL::GetName()        { return "1sT-AntiDLL"; }
 const char* AntiDLL::GetURL()         { return "https://discord.gg/g798xERK5Y"; }
