@@ -762,68 +762,60 @@ static void RunHiddenTargetTracking()
 }
 
 //==============================================================================
-// AdminCommands (console-only — server console / rcon)
+// AdminCommands — native ConCommands (server console / rcon)
 //==============================================================================
 
-static int ParseSlotArg(const char* content)
+CON_COMMAND_F(antidll_reload, "Reload 1sT-AntiDLL config and events", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
-    if (!content) return -1;
-    return atoi(content);
+    bool ok = LoadConfig();
+    LoadEventFile();
+    META_CONPRINTF("[1sT-AntiDLL] config reload %s\n", ok ? "OK" : "FAILED");
 }
 
-static void RegisterAdminCommands()
+CON_COMMAND_F(antidll_status, "Show 1sT-AntiDLL status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
-    g_pUtils->RegCommand(g_PLID, {"antidll_reload"}, {}, [](int slot, const char* content) -> bool {
-        bool ok = LoadConfig();
-        LoadEventFile();
-        g_pUtils->PrintToConsole(slot, "[1sT-AntiDLL] config reload %s\n", ok ? "OK" : "FAILED");
-        return true;
-    });
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    META_CONPRINTF("[1sT-AntiDLL] enabled=%d wh=%d debug_only=%d raytrace=%d raytrace_required=%d vis_mode=%s tracked=%zu\n",
+        g_Cfg.enabled, g_Cfg.whEnabled, g_Cfg.whDebugOnly, RayTrace_IsAvailable(), g_Cfg.raytraceRequired,
+        RayTrace_IsAvailable() ? "raytrace" : (g_Cfg.raytraceRequired ? "disabled" : "angle_only"),
+        g_States.size());
+}
 
-    g_pUtils->RegCommand(g_PLID, {"antidll_status"}, {}, [](int slot, const char* content) -> bool {
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        g_pUtils->PrintToConsole(slot,
-            "[1sT-AntiDLL] enabled=%d wh=%d debug_only=%d raytrace=%d raytrace_required=%d vis_mode=%s tracked=%zu\n",
-            g_Cfg.enabled, g_Cfg.whEnabled, g_Cfg.whDebugOnly, RayTrace_IsAvailable(), g_Cfg.raytraceRequired,
-            RayTrace_IsAvailable() ? "raytrace" : (g_Cfg.raytraceRequired ? "disabled" : "angle_only"),
-            g_States.size());
-        return true;
-    });
+CON_COMMAND_F(antidll_player, "Show 1sT-AntiDLL player state: antidll_player <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] usage: antidll_player <slot>\n"); return; }
+    int target = atoi(args[1]);
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    auto it = g_States.find(target);
+    if (it == g_States.end())
+    {
+        META_CONPRINTF("[1sT-AntiDLL] no state for slot %d\n", target);
+        return;
+    }
+    const PlayerState& st = it->second;
+    META_CONPRINTF("[1sT-AntiDLL] slot=%d name=%s points=%d punished=%d history=%zu\n",
+        target, st.name.c_str(), st.points, st.punished, st.history.size());
+}
 
-    g_pUtils->RegCommand(g_PLID, {"antidll_player"}, {}, [](int slot, const char* content) -> bool {
-        int target = ParseSlotArg(content);
-        std::lock_guard<std::mutex> lock(g_StateMutex);
-        auto it = g_States.find(target);
-        if (it == g_States.end())
-        {
-            g_pUtils->PrintToConsole(slot, "[1sT-AntiDLL] no state for slot %d\n", target);
-            return true;
-        }
-        const PlayerState& st = it->second;
-        g_pUtils->PrintToConsole(slot,
-            "[1sT-AntiDLL] slot=%d name=%s points=%d punished=%d history=%zu\n",
-            target, st.name.c_str(), st.points, st.punished, st.history.size());
-        return true;
-    });
+CON_COMMAND_F(antidll_reset, "Reset 1sT-AntiDLL player state: antidll_reset <slot>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] usage: antidll_reset <slot>\n"); return; }
+    int target = atoi(args[1]);
+    ResetPlayer(target);
+    META_CONPRINTF("[1sT-AntiDLL] reset state for slot %d\n", target);
+}
 
-    g_pUtils->RegCommand(g_PLID, {"antidll_reset"}, {}, [](int slot, const char* content) -> bool {
-        int target = ParseSlotArg(content);
-        ResetPlayer(target);
-        g_pUtils->PrintToConsole(slot, "[1sT-AntiDLL] reset state for slot %d\n", target);
-        return true;
-    });
+CON_COMMAND_F(antidll_test_webhook, "Queue a test Discord webhook", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    WebhookSend("1sT-AntiDLL \xe2\x80\x94 test", "Test webhook from antidll_test_webhook", 0x2ECC71);
+    META_CONPRINTF("[1sT-AntiDLL] test webhook queued (enabled=%d)\n", g_Cfg.webhookEnabled);
+}
 
-    g_pUtils->RegCommand(g_PLID, {"antidll_test_webhook"}, {}, [](int slot, const char* content) -> bool {
-        WebhookSend("1sT-AntiDLL — test", "Test webhook from antidll_test_webhook", 0x2ECC71);
-        g_pUtils->PrintToConsole(slot, "[1sT-AntiDLL] test webhook queued (enabled=%d)\n", g_Cfg.webhookEnabled);
-        return true;
-    });
-
-    g_pUtils->RegCommand(g_PLID, {"antidll_debug"}, {}, [](int slot, const char* content) -> bool {
-        g_Cfg.debugMode = (ParseSlotArg(content) != 0);
-        g_pUtils->PrintToConsole(slot, "[1sT-AntiDLL] debug_mode=%d\n", g_Cfg.debugMode);
-        return true;
-    });
+CON_COMMAND_F(antidll_debug, "Toggle 1sT-AntiDLL debug mode: antidll_debug <0|1>", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+{
+    if (args.ArgC() < 2) { META_CONPRINTF("[1sT-AntiDLL] debug_mode=%d\n", g_Cfg.debugMode); return; }
+    g_Cfg.debugMode = (atoi(args[1]) != 0);
+    META_CONPRINTF("[1sT-AntiDLL] debug_mode=%d\n", g_Cfg.debugMode);
 }
 
 //==============================================================================
@@ -895,7 +887,6 @@ void AntiDLL::AllPluginsLoaded()
 
     g_pPlayers->HookOnClientAuthorized(g_PLID, OnClientAuth);
     g_pUtils->StartupServer(g_PLID, StartupServer);
-    RegisterAdminCommands();
 
     WebhookSend("1sT-AntiDLL — plugin loaded",
         std::string("Version ") + GetVersion() + " loaded. wh_detection=" +
