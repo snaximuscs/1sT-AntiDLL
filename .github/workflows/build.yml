@@ -17,13 +17,13 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
 
     env:
-      HL2SDK_ROOT: "${{ github.workspace }}/external"
-      MMS_PATH: "${{ github.workspace }}/external/metamod-source"
-      MANIFEST_PATH: "${{ github.workspace }}/external/metamod-source/hl2sdk-manifests"
       CC: clang
       CXX: clang++
+      DEBIAN_FRONTEND: noninteractive
 
     steps:
       - name: Generate build number
@@ -33,40 +33,29 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Install container dependencies
+        run: |
+          apt-get update -qy
+          apt-get install -y git clang binutils zip python3 python3-pip python3-setuptools software-properties-common
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
       - name: Set up dependencies
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          
-          # 1. APT кэш цэвэрлэж, шаардлагатай үндсэн багцуудыг суулгах (Хуучин clang-10-ийг хассан)
-          sudo apt-get clean
-          sudo apt-get update -qy
-          sudo apt-get install -y git binutils zip python3-pip python3-setuptools
-          
-          # 2. AMBuild-ийг хамгийн цэвэр хувилбараар суулгах
           python3 -m pip install --upgrade pip
           python3 -m pip install git+https://github.com/alliedmodders/ambuild.git
-          
-          # 3. Гадаад SDK сангуудыг татах
+
           mkdir -p external
           cd external
           git clone --recursive --branch master --single-branch https://github.com/alliedmodders/metamod-source.git
           git clone --recursive --branch cs2 --single-branch https://github.com/alliedmodders/hl2sdk.git hl2sdk-cs2
-          
-          # 4. SchemaEntity-ийг татах
-          cd ${{ github.workspace }}
+
+          cd "$GITHUB_WORKSPACE"
           git clone https://github.com/pisex/SchemaEntity.git ../SchemaEntity
-          
-          # 5. Шинэ CS2 SDK-д зориулсан кодын нөхөөс (Patch) хийх
+
           echo "SchemaEntity-д CS2 SDK шинэчлэлтийн нөхөөс хийж байна..."
           sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' ../SchemaEntity/schemasystem.cpp
 
@@ -74,7 +63,10 @@ jobs:
         run: |
           mkdir -p build
           cd build
-          python3 ../configure.py -s cs2 --targets x86_64 --enable-optimize --hl2sdk-manifests=$MANIFEST_PATH --mms_path=$MMS_PATH --hl2sdk-root=$HL2SDK_ROOT
+          python3 ../configure.py -s cs2 --targets x86_64 --enable-optimize \
+            --hl2sdk-manifests="$GITHUB_WORKSPACE/external/metamod-source/hl2sdk-manifests" \
+            --mms_path="$GITHUB_WORKSPACE/external/metamod-source" \
+            --hl2sdk-root="$GITHUB_WORKSPACE/external"
           ambuild
 
       - name: Create archive
@@ -98,7 +90,7 @@ jobs:
     if: github.event_name == 'release'
     permissions:
       contents: write
-    runs-on: ubuntu-latest # <-- Гацаж байсан ubuntu-20.04 хувилбарыг шинэчлэв
+    runs-on: ubuntu-latest
   
     steps:
       - name: Download build artifact

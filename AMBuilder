@@ -17,8 +17,21 @@ for sdk_target in MMSPlugin.sdk_targets:
     os.path.join(builder.sourcePath, '..', 'SchemaEntity'),
   ]
 
+  # --- Optional: FUNPLAY-pro-CS2/Ray-Trace integration ---
+  # Hidden-target visibility checks are compiled OUT by default so the plugin always builds
+  # even without the Ray-Trace headers. To enable:
+  #   1. Clone the Ray-Trace project and point RAYTRACE_PUBLIC at its `public/` dir.
+  #   2. Uncomment the two lines below (include path + define).
+  # import os
+  # binary.compiler.cxxincludes += [ os.environ.get('RAYTRACE_PUBLIC', os.path.join(builder.sourcePath, '..', 'Ray-Trace', 'public')) ]
+  # binary.compiler.defines += ['ANTIDLL_HAVE_RAYTRACE']
+
+  binary.compiler.postlink += ['-lpthread']
+
   binary.sources += [
     'antidll.cpp',
+    'raytrace.cpp',
+    'webhook_queue.cpp',
     os.path.join('..', 'SchemaEntity', 'schemasystem.cpp'),
   ]
 
