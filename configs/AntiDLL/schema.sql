@@ -1,5 +1,11 @@
 -- 1sT-AntiDLL MySQL schema
--- Run this once on your MySQL/MariaDB server to create the required tables.
+-- Run this once on your MySQL/MariaDB server.
+
+CREATE DATABASE IF NOT EXISTS antidll
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
+
+USE antidll;
 
 CREATE TABLE IF NOT EXISTS antidll_servers (
     id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -36,11 +42,12 @@ CREATE TABLE IF NOT EXISTS antidll_detections (
     evidence_json       JSON
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Example: register your servers (one-time setup)
--- The plugin auto-detects its own IP:port and queries this table.
--- Same plugin binary + config on all servers — no per-server config needed.
+-- Register your servers (one-time setup).
+-- The plugin auto-detects its IP:port and queries this table.
+-- Same plugin binary + config on all servers.
 
--- INSERT INTO antidll_servers (server_name, server_group, region, ip, port, enabled)
+-- INSERT INTO antidll_servers
+-- (server_name, server_group, region, ip, port, enabled)
 -- VALUES
 -- ('1sT Competitive #1',  'Competitive', 'MN', '103.236.194.19', 27015, 1),
 -- ('1sT Competitive #2',  'Competitive', 'MN', '103.236.194.19', 27016, 1),

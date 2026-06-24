@@ -133,12 +133,18 @@ struct Config
     bool         webhookViolations  = true;
     bool         webhookPunishments = true;
 
+    // --- Database ---
+    bool         dbEnabled     = false;
+    std::string  dbConfigName  = "antidll";
+
     // --- Server Identity ---
     bool         identityEnabled         = true;
+    std::string  identityTable           = "antidll_servers";
+    std::string  detectionTable          = "antidll_detections";
     float        identityRefreshInterval = 300.0f;
     std::string  identityFailName        = "Unknown Server";
 
-    // --- MySQL ---
+    // Populated from configs/databases.cfg at load time
     MySQLConfig  mysql;
 };
 
@@ -656,6 +662,56 @@ static void LoadEventFile()
     file.close();
 }
 
+static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
+{
+    const char* paths[] = {
+        "addons/counterstrikesharp/configs/databases.cfg",
+        "configs/databases.cfg",
+    };
+
+    KeyValues* pKV = new KeyValues("Databases");
+    bool loaded = false;
+    const char* foundPath = nullptr;
+    for (const char* path : paths)
+    {
+        if (pKV->LoadFromFile(g_pFullFileSystem, path))
+        {
+            loaded = true;
+            foundPath = path;
+            break;
+        }
+    }
+
+    if (!loaded)
+    {
+        META_CONPRINTF("[1sT-AntiDLL] databases.cfg not found in any search path\n");
+        pKV->deleteThis();
+        return false;
+    }
+
+    KeyValues* pSection = pKV->FindKey(configName.c_str());
+    if (!pSection)
+    {
+        META_CONPRINTF("[1sT-AntiDLL] Database config '%s' not found in %s\n",
+            configName.c_str(), foundPath);
+        pKV->deleteThis();
+        return false;
+    }
+
+    out.host     = pSection->GetString("host", "127.0.0.1");
+    out.port     = pSection->GetInt("port", 3306);
+    out.user     = pSection->GetString("user", "root");
+    out.password = pSection->GetString("pass", "");
+    out.database = pSection->GetString("database", "antidll");
+    out.enabled  = true;
+
+    META_CONPRINTF("[1sT-AntiDLL] Loaded database config '%s' from %s (host=%s:%d db=%s)\n",
+        configName.c_str(), foundPath, out.host.c_str(), out.port, out.database.c_str());
+
+    pKV->deleteThis();
+    return true;
+}
+
 static bool LoadConfig()
 {
     KeyValues* pKV = new KeyValues("Config");
@@ -739,21 +795,32 @@ static bool LoadConfig()
     c.webhookViolations  = pKV->GetBool("webhook_violations", true);
     c.webhookPunishments = pKV->GetBool("webhook_punishments", true);
 
+    // Database
+    c.dbEnabled    = pKV->GetBool("database_enabled", false);
+    c.dbConfigName = pKV->GetString("database_config", "antidll");
+
     // Server identity
     c.identityEnabled         = pKV->GetBool("server_identity_enabled", true);
+    c.identityTable           = pKV->GetString("server_identity_table", "antidll_servers");
+    c.detectionTable          = pKV->GetString("detection_log_table", "antidll_detections");
     c.identityRefreshInterval = pKV->GetFloat("server_identity_refresh_interval", 300.0f);
     c.identityFailName        = pKV->GetString("server_identity_fail_name", "Unknown Server");
 
-    // MySQL
-    c.mysql.enabled        = pKV->GetBool("mysql_enabled", false);
-    c.mysql.host           = pKV->GetString("mysql_host", "127.0.0.1");
-    c.mysql.port           = pKV->GetInt("mysql_port", 3306);
-    c.mysql.user           = pKV->GetString("mysql_user", "root");
-    c.mysql.password       = pKV->GetString("mysql_password", "");
-    c.mysql.database       = pKV->GetString("mysql_database", "antidll");
-    c.mysql.serverTable    = pKV->GetString("server_identity_table", "antidll_servers");
-    c.mysql.detectionTable = pKV->GetString("mysql_detection_table", "antidll_detections");
-    c.mysql.failName       = c.identityFailName;
+    // Load DB credentials from configs/databases.cfg (not from settings.ini)
+    if (c.dbEnabled)
+    {
+        if (!LoadDatabaseConfig(c.dbConfigName, c.mysql))
+        {
+            c.dbEnabled = false;
+            c.mysql.enabled = false;
+        }
+        else
+        {
+            c.mysql.serverTable    = c.identityTable;
+            c.mysql.detectionTable = c.detectionTable;
+            c.mysql.failName       = c.identityFailName;
+        }
+    }
 
     // Safety clamps
     if (c.whCheckInterval     < 0.25f) c.whCheckInterval = 0.25f;
@@ -871,7 +938,7 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
     {
         ServerIdentity sid = GetServerIdentity();
         const char* playerIp = g_pPlayers->GetIpAddress(slot);
-        std::string sql = "INSERT INTO " + g_Cfg.mysql.detectionTable +
+        std::string sql = "INSERT INTO " + g_Cfg.detectionTable +
             " (server_name, server_group, region, server_ip, server_port, map_name,"
             " player_name, steamid64, player_ip, detection_category, detection_reason,"
             " points_added, points_total, threshold_points, action_taken, evidence_json)"
@@ -1480,16 +1547,20 @@ CON_COMMAND_F(antidll_server_identity, "Show server identity info", FCVAR_GAMEDL
         id.mysqlMatched ? "yes" : "no");
     if (!id.mysqlMatched && id.mysqlConnected)
         META_CONPRINTF("  (no row in %s for %s:%d)\n",
-            g_Cfg.mysql.serverTable.c_str(), g_DetectedIp.c_str(), g_DetectedPort);
+            g_Cfg.identityTable.c_str(), g_DetectedIp.c_str(), g_DetectedPort);
 }
 
 CON_COMMAND_F(antidll_mysql_status, "Show MySQL connection status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
-    META_CONPRINTF("[1sT-AntiDLL] MySQL:\n");
-    META_CONPRINTF("  Enabled: %d\n", g_Cfg.mysql.enabled);
-    META_CONPRINTF("  Library loaded: %d\n", g_MySQL.IsLoaded());
-    META_CONPRINTF("  Connected: %d\n", g_MySQL.IsConnected());
-    META_CONPRINTF("  Host: %s:%d  DB: %s\n", g_Cfg.mysql.host.c_str(), g_Cfg.mysql.port, g_Cfg.mysql.database.c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Database:\n");
+    META_CONPRINTF("  Enabled: %d  Config: '%s'\n", g_Cfg.dbEnabled, g_Cfg.dbConfigName.c_str());
+    META_CONPRINTF("  Library loaded: %d  Connected: %d\n", g_MySQL.IsLoaded(), g_MySQL.IsConnected());
+    if (g_Cfg.dbEnabled)
+        META_CONPRINTF("  Host: %s:%d  DB: %s  User: %s\n",
+            g_Cfg.mysql.host.c_str(), g_Cfg.mysql.port,
+            g_Cfg.mysql.database.c_str(), g_Cfg.mysql.user.c_str());
+    META_CONPRINTF("  Identity table: %s  Detection table: %s\n",
+        g_Cfg.identityTable.c_str(), g_Cfg.detectionTable.c_str());
 }
 
 //==============================================================================
@@ -1565,7 +1636,7 @@ void AntiDLL::AllPluginsLoaded()
     }
 
     // MySQL (optional) — server identity is resolved from DB, not config
-    if (g_Cfg.mysql.enabled)
+    if (g_Cfg.dbEnabled)
     {
         if (g_MySQL.Init(g_Cfg.mysql))
         {
@@ -1593,7 +1664,7 @@ void AntiDLL::AllPluginsLoaded()
     {
         auto fields = BuildServerFields();
         fields.push_back({"Version",            GetVersion(),               true});
-        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "connecting..." : "disabled"), true});
+        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "connecting..." : "disabled"), true});
         fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
         fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
         fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
@@ -1609,7 +1680,7 @@ void AntiDLL::AllPluginsLoaded()
     META_CONPRINTF("  1sT-AntiDLL v%s loaded\n", GetVersion());
     META_CONPRINTF("  Server: %s (%s)\n", GetServerDisplayName().c_str(), GetServerAddress().c_str());
     META_CONPRINTF("  MySQL: %s  RayTrace: %s\n",
-        g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "loading" : "disabled"),
+        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"),
         RayTrace_IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("  WH: %s  Aim: %s  Trigger: %s  Composite: %s\n",
         g_Cfg.whEnabled ? "on" : "off", g_Cfg.aimEnabled ? "on" : "off",
@@ -1665,7 +1736,7 @@ void AntiDLL::AllPluginsLoaded()
     }
 
     // MySQL server identity refresh (periodic re-query)
-    if (g_Cfg.mysql.enabled && g_Cfg.identityEnabled)
+    if (g_Cfg.dbEnabled && g_Cfg.identityEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.identityRefreshInterval, []() {
             if (g_MySQL.IsLoaded())
