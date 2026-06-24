@@ -117,13 +117,12 @@ ServerIdentity MySQLManager::GetIdentity() const
     return m_identity;
 }
 
-void MySQLManager::RequestIdentityRefresh(const std::string& ip, int port, const std::string& fallback)
+void MySQLManager::RequestIdentityRefresh(const std::string& ip, int port)
 {
     Task t;
-    t.type            = Task::IDENTITY_REFRESH;
-    t.refreshIp       = ip;
-    t.refreshPort     = port;
-    t.refreshFallback = fallback;
+    t.type      = Task::IDENTITY_REFRESH;
+    t.refreshIp = ip;
+    t.refreshPort = port;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         m_queue.push(std::move(t));
@@ -144,15 +143,18 @@ void MySQLManager::QueueSQL(const std::string& sql)
     m_cv.notify_one();
 }
 
-void MySQLManager::DoRefreshIdentity(const std::string& ip, int port, const std::string& fallback)
+void MySQLManager::DoRefreshIdentity(const std::string& ip, int port)
 {
-    if (!m_connected.load() && !Connect())
+    bool connected = m_connected.load() || Connect();
+
+    if (!connected)
     {
         std::lock_guard<std::mutex> lock(m_identityMutex);
-        m_identity.name     = fallback;
-        m_identity.ip       = ip;
-        m_identity.port     = port;
-        m_identity.resolved = false;
+        m_identity.serverName    = m_cfg.failName;
+        m_identity.ip            = ip;
+        m_identity.port          = port;
+        m_identity.mysqlMatched  = false;
+        m_identity.mysqlConnected = false;
         return;
     }
 
@@ -162,11 +164,13 @@ void MySQLManager::DoRefreshIdentity(const std::string& ip, int port, const std:
 
     if (fn_query(m_conn, sql.c_str()) != 0)
     {
+        fprintf(stderr, "[1sT-AntiDLL] MySQL identity query error: %s\n", fn_error(m_conn));
         std::lock_guard<std::mutex> lock(m_identityMutex);
-        m_identity.name     = fallback;
-        m_identity.ip       = ip;
-        m_identity.port     = port;
-        m_identity.resolved = false;
+        m_identity.serverName    = m_cfg.failName;
+        m_identity.ip            = ip;
+        m_identity.port          = port;
+        m_identity.mysqlMatched  = false;
+        m_identity.mysqlConnected = true;
         return;
     }
 
@@ -174,29 +178,33 @@ void MySQLManager::DoRefreshIdentity(const std::string& ip, int port, const std:
     if (!res)
     {
         std::lock_guard<std::mutex> lock(m_identityMutex);
-        m_identity.name     = fallback;
-        m_identity.ip       = ip;
-        m_identity.port     = port;
-        m_identity.resolved = false;
+        m_identity.serverName    = m_cfg.failName;
+        m_identity.ip            = ip;
+        m_identity.port          = port;
+        m_identity.mysqlMatched  = false;
+        m_identity.mysqlConnected = true;
         return;
     }
 
     char** row = fn_fetch_row(res);
     {
         std::lock_guard<std::mutex> lock(m_identityMutex);
-        m_identity.ip   = ip;
-        m_identity.port = port;
+        m_identity.ip              = ip;
+        m_identity.port            = port;
+        m_identity.mysqlConnected  = true;
         if (row)
         {
-            m_identity.name     = row[0] ? row[0] : fallback;
-            m_identity.group    = row[1] ? row[1] : "";
-            m_identity.region   = row[2] ? row[2] : "";
-            m_identity.resolved = true;
+            m_identity.serverName  = row[0] ? row[0] : m_cfg.failName;
+            m_identity.serverGroup = row[1] ? row[1] : "";
+            m_identity.region      = row[2] ? row[2] : "";
+            m_identity.mysqlMatched = true;
         }
         else
         {
-            m_identity.name     = fallback;
-            m_identity.resolved = false;
+            m_identity.serverName  = m_cfg.failName;
+            m_identity.serverGroup.clear();
+            m_identity.region.clear();
+            m_identity.mysqlMatched = false;
         }
     }
     fn_free_result(res);
@@ -224,7 +232,7 @@ void MySQLManager::WorkerLoop()
             ExecSQL(task.sql);
             break;
         case Task::IDENTITY_REFRESH:
-            DoRefreshIdentity(task.refreshIp, task.refreshPort, task.refreshFallback);
+            DoRefreshIdentity(task.refreshIp, task.refreshPort);
             break;
         }
     }

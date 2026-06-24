@@ -26,6 +26,8 @@ IPlayersApi* g_pPlayers = nullptr;
 
 static std::string  g_MapName = "unknown";
 static bool         g_RoundActive = true;
+static std::string  g_DetectedIp   = "0.0.0.0";
+static int          g_DetectedPort = 27015;
 
 //==============================================================================
 // Detection categories
@@ -131,11 +133,10 @@ struct Config
     bool         webhookViolations  = true;
     bool         webhookPunishments = true;
 
-    // --- Server identity ---
-    std::string  serverPublicIp;
-    int          serverPort           = 0;
-    std::string  serverNameFallback   = "Unknown Server";
+    // --- Server Identity ---
+    bool         identityEnabled         = true;
     float        identityRefreshInterval = 300.0f;
+    std::string  identityFailName        = "Unknown Server";
 
     // --- MySQL ---
     MySQLConfig  mysql;
@@ -378,25 +379,84 @@ static int GetMaxClients()
 }
 
 //==============================================================================
+// Server address auto-detection (reads /proc/self/cmdline on Linux)
+//==============================================================================
+
+static void DetectServerAddress()
+{
+    g_DetectedPort = 27015;
+    g_DetectedIp   = "0.0.0.0";
+
+    std::ifstream f("/proc/self/cmdline", std::ios::binary);
+    if (!f.is_open()) return;
+
+    std::string data((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+
+    std::vector<std::string> args;
+    size_t start = 0;
+    for (size_t i = 0; i <= data.size(); i++)
+    {
+        if (i == data.size() || data[i] == '\0')
+        {
+            if (i > start)
+                args.push_back(data.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+
+    for (size_t i = 0; i + 1 < args.size(); i++)
+    {
+        if ((args[i] == "-port" || args[i] == "+hostport") )
+        {
+            int p = atoi(args[i + 1].c_str());
+            if (p > 0) g_DetectedPort = p;
+        }
+        if (args[i] == "-ip" || args[i] == "+ip" || args[i] == "+net_public_adr")
+        {
+            if (!args[i + 1].empty() && args[i + 1][0] != '-' && args[i + 1][0] != '+')
+                g_DetectedIp = args[i + 1];
+        }
+        if (args[i] == "+hostip")
+        {
+            long hostip = strtol(args[i + 1].c_str(), nullptr, 10);
+            if (hostip > 0)
+            {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%ld.%ld.%ld.%ld",
+                    (hostip >> 24) & 0xFF, (hostip >> 16) & 0xFF,
+                    (hostip >> 8) & 0xFF, hostip & 0xFF);
+                g_DetectedIp = buf;
+            }
+        }
+    }
+}
+
+//==============================================================================
 // Server identity helpers
 //==============================================================================
 
+static ServerIdentity GetServerIdentity()
+{
+    if (g_MySQL.IsLoaded())
+        return g_MySQL.GetIdentity();
+
+    ServerIdentity id;
+    id.serverName = g_Cfg.identityFailName;
+    id.ip         = g_DetectedIp;
+    id.port       = g_DetectedPort;
+    return id;
+}
+
 static std::string GetServerDisplayName()
 {
-    if (g_MySQL.IsConnected())
-    {
-        ServerIdentity id = g_MySQL.GetIdentity();
-        if (id.resolved && !id.name.empty())
-            return id.name;
-    }
-    return g_Cfg.serverNameFallback.empty() ? "Unknown Server" : g_Cfg.serverNameFallback;
+    return GetServerIdentity().serverName;
 }
 
 static std::string GetServerAddress()
 {
-    std::string ip = g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp;
-    int port = g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015;
-    return ip + ":" + std::to_string(port);
+    ServerIdentity id = GetServerIdentity();
+    return id.ip + ":" + std::to_string(id.port);
 }
 
 static std::string GetPlayerCountStr()
@@ -543,12 +603,18 @@ static void WebhookSend(const std::string& title, const std::string& description
 
 static std::vector<WebhookField> BuildServerFields()
 {
-    return {
-        {"Server",  GetServerDisplayName(),   true},
-        {"Address", GetServerAddress(),        true},
-        {"Map",     g_MapName,                 true},
-        {"Players", GetPlayerCountStr(),       true},
+    ServerIdentity id = GetServerIdentity();
+    std::vector<WebhookField> fields = {
+        {"Server",  id.serverName, true},
+        {"Address", id.ip + ":" + std::to_string(id.port), true},
     };
+    if (!id.serverGroup.empty())
+        fields.push_back({"Group", id.serverGroup, true});
+    if (!id.region.empty())
+        fields.push_back({"Region", id.region, true});
+    fields.push_back({"Map",     g_MapName,          true});
+    fields.push_back({"Players", GetPlayerCountStr(), true});
+    return fields;
 }
 
 //==============================================================================
@@ -674,10 +740,9 @@ static bool LoadConfig()
     c.webhookPunishments = pKV->GetBool("webhook_punishments", true);
 
     // Server identity
-    c.serverPublicIp          = pKV->GetString("server_public_ip", "");
-    c.serverPort              = pKV->GetInt("server_port", 0);
-    c.serverNameFallback      = pKV->GetString("server_name_fallback", "Unknown Server");
+    c.identityEnabled         = pKV->GetBool("server_identity_enabled", true);
     c.identityRefreshInterval = pKV->GetFloat("server_identity_refresh_interval", 300.0f);
+    c.identityFailName        = pKV->GetString("server_identity_fail_name", "Unknown Server");
 
     // MySQL
     c.mysql.enabled        = pKV->GetBool("mysql_enabled", false);
@@ -686,8 +751,9 @@ static bool LoadConfig()
     c.mysql.user           = pKV->GetString("mysql_user", "root");
     c.mysql.password       = pKV->GetString("mysql_password", "");
     c.mysql.database       = pKV->GetString("mysql_database", "antidll");
-    c.mysql.serverTable    = pKV->GetString("mysql_server_table", "antidll_servers");
+    c.mysql.serverTable    = pKV->GetString("server_identity_table", "antidll_servers");
     c.mysql.detectionTable = pKV->GetString("mysql_detection_table", "antidll_detections");
+    c.mysql.failName       = c.identityFailName;
 
     // Safety clamps
     if (c.whCheckInterval     < 0.25f) c.whCheckInterval = 0.25f;
@@ -803,15 +869,17 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
     // MySQL detection log
     if (g_MySQL.IsConnected())
     {
-        ServerIdentity sid = g_MySQL.GetIdentity();
+        ServerIdentity sid = GetServerIdentity();
+        const char* playerIp = g_pPlayers->GetIpAddress(slot);
         std::string sql = "INSERT INTO " + g_Cfg.mysql.detectionTable +
             " (server_name, server_group, region, server_ip, server_port, map_name,"
-            " player_name, steamid64, detection_category, detection_reason,"
-            " points_added, points_total, threshold, action_taken, evidence_json)"
-            " VALUES ('" + SqlEscape(sid.name) + "','" + SqlEscape(sid.group) + "','" +
+            " player_name, steamid64, player_ip, detection_category, detection_reason,"
+            " points_added, points_total, threshold_points, action_taken, evidence_json)"
+            " VALUES ('" + SqlEscape(sid.serverName) + "','" + SqlEscape(sid.serverGroup) + "','" +
             SqlEscape(sid.region) + "','" + SqlEscape(sid.ip) + "'," +
             std::to_string(sid.port) + ",'" + SqlEscape(g_MapName) + "','" +
             SqlEscape(szName) + "','" + szSteamID64 + "','" +
+            SqlEscape(playerIp ? playerIp : "") + "','" +
             SqlEscape(DetCategoryStr(category)) + "','" + SqlEscape(reason) + "'," +
             std::to_string(points) + "," + std::to_string(after) + "," +
             std::to_string(g_Cfg.violationThreshold) + ",'" +
@@ -1402,19 +1470,17 @@ CON_COMMAND_F(antidll_debug, "Toggle debug mode: antidll_debug <0|1>", FCVAR_GAM
 
 CON_COMMAND_F(antidll_server_identity, "Show server identity info", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
+    ServerIdentity id = GetServerIdentity();
     META_CONPRINTF("[1sT-AntiDLL] Server Identity:\n");
-    META_CONPRINTF("  Name: %s\n", GetServerDisplayName().c_str());
-    META_CONPRINTF("  Address: %s\n", GetServerAddress().c_str());
-    if (g_MySQL.IsConnected())
-    {
-        ServerIdentity id = g_MySQL.GetIdentity();
-        META_CONPRINTF("  MySQL resolved: %s\n", id.resolved ? "yes" : "no");
-        META_CONPRINTF("  Group: %s  Region: %s\n", id.group.c_str(), id.region.c_str());
-    }
-    else
-    {
-        META_CONPRINTF("  MySQL: not connected (using fallback)\n");
-    }
+    META_CONPRINTF("  Detected address: %s:%d\n", g_DetectedIp.c_str(), g_DetectedPort);
+    META_CONPRINTF("  Server name: %s\n", id.serverName.c_str());
+    META_CONPRINTF("  Group: %s  Region: %s\n", id.serverGroup.c_str(), id.region.c_str());
+    META_CONPRINTF("  MySQL connected: %s  MySQL matched: %s\n",
+        id.mysqlConnected ? "yes" : "no",
+        id.mysqlMatched ? "yes" : "no");
+    if (!id.mysqlMatched && id.mysqlConnected)
+        META_CONPRINTF("  (no row in %s for %s:%d)\n",
+            g_Cfg.mysql.serverTable.c_str(), g_DetectedIp.c_str(), g_DetectedPort);
 }
 
 CON_COMMAND_F(antidll_mysql_status, "Show MySQL connection status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
@@ -1486,6 +1552,10 @@ void AntiDLL::AllPluginsLoaded()
     LoadEventFile();
     LoadConfig();
 
+    // Auto-detect server IP:port from process command line
+    DetectServerAddress();
+    META_CONPRINTF("[1sT-AntiDLL] Detected server address: %s:%d\n", g_DetectedIp.c_str(), g_DetectedPort);
+
     // Ray-Trace (optional)
     if (!RayTrace_Load())
     {
@@ -1494,15 +1564,12 @@ void AntiDLL::AllPluginsLoaded()
                 "Hidden-target visibility checks and trigger detection are disabled.", 0xE67E22);
     }
 
-    // MySQL (optional)
+    // MySQL (optional) — server identity is resolved from DB, not config
     if (g_Cfg.mysql.enabled)
     {
         if (g_MySQL.Init(g_Cfg.mysql))
         {
-            g_MySQL.RequestIdentityRefresh(
-                g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp,
-                g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015,
-                g_Cfg.serverNameFallback);
+            g_MySQL.RequestIdentityRefresh(g_DetectedIp, g_DetectedPort);
         }
     }
 
@@ -1524,21 +1591,16 @@ void AntiDLL::AllPluginsLoaded()
     // Plugin loaded webhook
     if (g_Cfg.webhookPluginLoad)
     {
-        std::vector<WebhookField> fields = {
-            {"Server",       GetServerDisplayName(),    true},
-            {"Address",      GetServerAddress(),         true},
-            {"Map",          g_MapName,                  true},
-            {"Players",      GetPlayerCountStr(),        true},
-            {"Version",      GetVersion(),               true},
-            {"RayTrace",     RayTrace_IsAvailable() ? "loaded" : "missing", true},
-            {"MySQL",        g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "connecting..." : "disabled"), true},
-            {"WH Detection", g_Cfg.whEnabled ? "on" : "off", true},
-            {"Aim Detection", g_Cfg.aimEnabled ? "on" : "off", true},
-            {"Trigger Detection", g_Cfg.triggerEnabled ? "on" : "off", true},
-            {"Debug Only",   (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "yes" : "no", true},
-            {"Punishment",   g_Cfg.punishType ? "ban" : "kick", true},
-            {"Threshold",    std::to_string(g_Cfg.violationThreshold), true},
-        };
+        auto fields = BuildServerFields();
+        fields.push_back({"Version",            GetVersion(),               true});
+        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : (g_Cfg.mysql.enabled ? "connecting..." : "disabled"), true});
+        fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
+        fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
+        fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
+        fields.push_back({"Trigger Detection",  g_Cfg.triggerEnabled ? "on" : "off", true});
+        fields.push_back({"Debug Only",         (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "yes" : "no", true});
+        fields.push_back({"Punishment",         g_Cfg.punishType ? "ban" : "kick", true});
+        fields.push_back({"Threshold",          std::to_string(g_Cfg.violationThreshold), true});
         WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
     }
 
@@ -1602,17 +1664,12 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // MySQL server identity refresh
-    if (g_Cfg.mysql.enabled)
+    // MySQL server identity refresh (periodic re-query)
+    if (g_Cfg.mysql.enabled && g_Cfg.identityEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.identityRefreshInterval, []() {
             if (g_MySQL.IsLoaded())
-            {
-                g_MySQL.RequestIdentityRefresh(
-                    g_Cfg.serverPublicIp.empty() ? "0.0.0.0" : g_Cfg.serverPublicIp,
-                    g_Cfg.serverPort > 0 ? g_Cfg.serverPort : 27015,
-                    g_Cfg.serverNameFallback);
-            }
+                g_MySQL.RequestIdentityRefresh(g_DetectedIp, g_DetectedPort);
             return g_Cfg.identityRefreshInterval;
         });
     }

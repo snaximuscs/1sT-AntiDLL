@@ -9,24 +9,26 @@
 
 struct MySQLConfig
 {
-    bool        enabled       = false;
-    std::string host          = "127.0.0.1";
-    int         port          = 3306;
-    std::string user          = "root";
+    bool        enabled        = false;
+    std::string host           = "127.0.0.1";
+    int         port           = 3306;
+    std::string user           = "root";
     std::string password;
-    std::string database      = "antidll";
-    std::string serverTable   = "antidll_servers";
+    std::string database       = "antidll";
+    std::string serverTable    = "antidll_servers";
     std::string detectionTable = "antidll_detections";
+    std::string failName       = "Unknown Server";
 };
 
 struct ServerIdentity
 {
-    std::string name;
-    std::string group;
+    std::string serverName  = "Unknown Server";
+    std::string serverGroup;
     std::string region;
-    std::string ip;
-    int         port     = 27015;
-    bool        resolved = false;
+    std::string ip          = "0.0.0.0";
+    int         port        = 27015;
+    bool        mysqlMatched   = false;
+    bool        mysqlConnected = false;
 };
 
 class MySQLManager
@@ -41,7 +43,7 @@ public:
     bool IsLoaded()    const { return m_lib != nullptr; }
 
     ServerIdentity GetIdentity() const;
-    void RequestIdentityRefresh(const std::string& ip, int port, const std::string& fallback);
+    void RequestIdentityRefresh(const std::string& ip, int port);
     void QueueSQL(const std::string& sql);
 
 private:
@@ -52,14 +54,13 @@ private:
         std::string sql;
         std::string refreshIp;
         int         refreshPort = 0;
-        std::string refreshFallback;
     };
 
     void WorkerLoop();
     bool Connect();
     void Disconnect();
     bool ExecSQL(const std::string& sql);
-    void DoRefreshIdentity(const std::string& ip, int port, const std::string& fallback);
+    void DoRefreshIdentity(const std::string& ip, int port);
     std::string Escape(const std::string& s);
 
     void*  m_lib  = nullptr;
