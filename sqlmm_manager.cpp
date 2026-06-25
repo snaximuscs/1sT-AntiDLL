@@ -25,13 +25,15 @@ bool SQLMMManager::Init(ISQLInterface* sqlInterface,
     info.user     = m_user.c_str();
     info.pass     = m_pass.c_str();
     info.database = m_database.c_str();
-    info.timeout  = 30;
+    info.timeout  = 10;
 
     m_conn = client->CreateMySQLConnection(info);
     if (!m_conn) return false;
 
     m_conn->Connect([this](bool success) {
         m_connected = success;
+        if (!success)
+            m_identityFailed = true;
     });
 
     return true;
@@ -85,6 +87,7 @@ void SQLMMManager::RefreshIdentity()
         {
             m_identity.serverName  = failName;
             m_identity.mysqlMatched = false;
+            m_identityFailed = true;
             return;
         }
 
@@ -93,6 +96,7 @@ void SQLMMManager::RefreshIdentity()
         {
             m_identity.serverName  = failName;
             m_identity.mysqlMatched = false;
+            m_identityFailed = true;
             return;
         }
 
@@ -105,6 +109,7 @@ void SQLMMManager::RefreshIdentity()
         m_identity.serverGroup  = group  ? group  : "";
         m_identity.region       = region ? region : "";
         m_identity.mysqlMatched = true;
+        m_identityFailed = false;
     });
 }
 

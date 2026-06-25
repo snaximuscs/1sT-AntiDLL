@@ -28,6 +28,8 @@ static std::string  g_MapName = "unknown";
 static bool         g_RoundActive = true;
 static std::string  g_DetectedIp   = "0.0.0.0";
 static int          g_DetectedPort = 27015;
+static bool         g_StartupDone = false;
+static int          g_StartupTicks = 0;
 
 //==============================================================================
 // Detection categories
@@ -706,8 +708,6 @@ static bool LoadDatabaseConfig(const std::string& configName,
     outUser     = pSection->GetString("user", "root");
     outPass     = pSection->GetString("pass", "");
     outDatabase = pSection->GetString("database", "antidll");
-
-    META_CONPRINTF("[1sT-AntiDLL] Database config loaded\n");
 
     delete pKV;
     return true;
@@ -1568,6 +1568,68 @@ CON_COMMAND_F(antidll_sql_status, "Show SQLMM / database status", FCVAR_GAMEDLL 
 }
 
 //==============================================================================
+// Deferred startup (waits for SQLMM to connect + identity to resolve)
+//==============================================================================
+
+static const char* GetMySQLStatusStr()
+{
+    if (g_SQLMM.IsConnected()) return "connected";
+    if (g_SQLMM.IsAvailable()) return "connecting";
+    if (g_Cfg.dbEnabled) return "failed";
+    return "disabled";
+}
+
+static void PrintStartupBanner()
+{
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] --------------------ANTIDLL LOADED-------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", g_AntiDLL.GetVersion());
+    META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n", GetMySQLStatusStr());
+    META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
+    META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
+    META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
+        (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "on" : "off");
+}
+
+static void SendStartupWebhook()
+{
+    if (!g_Cfg.webhookPluginLoad) return;
+
+    ServerIdentity id = GetServerIdentity();
+    std::vector<WebhookField> fields = {
+        {"Server",  id.serverName, true},
+        {"Address", id.ip + ":" + std::to_string(id.port), true},
+    };
+    if (!id.serverGroup.empty())
+        fields.push_back({"Group", id.serverGroup, true});
+    if (!id.region.empty())
+        fields.push_back({"Region", id.region, true});
+    fields.push_back({"Version",            g_AntiDLL.GetVersion(),     true});
+    fields.push_back({"MySQL",              GetMySQLStatusStr(),         true});
+    fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
+    fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
+    fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
+    fields.push_back({"Trigger Detection",  g_Cfg.triggerEnabled ? "on" : "off", true});
+    fields.push_back({"Debug Only",         (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "yes" : "no", true});
+    fields.push_back({"Punishment",         g_Cfg.punishType ? "ban" : "kick", true});
+    fields.push_back({"Threshold",          std::to_string(g_Cfg.violationThreshold), true});
+    WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
+}
+
+static void CompleteStartup()
+{
+    if (g_StartupDone) return;
+    g_StartupDone = true;
+    PrintStartupBanner();
+    SendStartupWebhook();
+}
+
+//==============================================================================
 // Lifecycle
 //==============================================================================
 
@@ -1626,18 +1688,8 @@ void AntiDLL::AllPluginsLoaded()
 
     LoadEventFile();
     LoadConfig();
-
-    // Auto-detect server IP:port from process command line
     DetectServerAddress();
-    META_CONPRINTF("[1sT-AntiDLL] Detected server address: %s:%d\n", g_DetectedIp.c_str(), g_DetectedPort);
-
-    // Ray-Trace (optional)
-    if (!RayTrace_Load())
-    {
-        if (g_Cfg.webhookEnabled)
-            WebhookSend("1sT-AntiDLL \xe2\x80\x94 Ray-Trace missing",
-                "Hidden-target visibility checks and trigger detection are disabled.", 0xE67E22);
-    }
+    RayTrace_Load();
 
     // SQLMM database (optional)
     if (g_Cfg.dbEnabled)
@@ -1646,13 +1698,11 @@ void AntiDLL::AllPluginsLoaded()
         ISQLInterface* sqlInterface = (ISQLInterface*)g_SMAPI->MetaFactory(SQLMM_INTERFACE, &sqlRet, NULL);
         if (!sqlInterface || sqlRet == META_IFACE_FAILED)
         {
-            META_CONPRINTF("[1sT-AntiDLL] SQLMM interface not found. Database features disabled.\n");
             g_Cfg.dbEnabled = false;
         }
         else if (!g_SQLMM.Init(sqlInterface, g_Cfg.dbHost, g_Cfg.dbPort,
                                 g_Cfg.dbUser, g_Cfg.dbPass, g_Cfg.dbDatabase))
         {
-            META_CONPRINTF("[1sT-AntiDLL] Failed to create MySQL connection.\n");
             g_Cfg.dbEnabled = false;
         }
         else
@@ -1662,14 +1712,13 @@ void AntiDLL::AllPluginsLoaded()
         }
     }
 
-    // Webhook
+    // Webhook worker
     if (g_Cfg.webhookEnabled && !g_Cfg.webhookUrl.empty())
         g_Webhook.Start(g_Cfg.webhookUrl);
 
     g_pPlayers->HookOnClientAuthorized(g_PLID, OnClientAuth);
     g_pUtils->StartupServer(g_PLID, StartupServer);
 
-    // Round state hooks
     g_pUtils->HookEvent(g_PLID, "round_start", [](const char*, IGameEvent*, bool) {
         g_RoundActive = true;
     });
@@ -1677,46 +1726,19 @@ void AntiDLL::AllPluginsLoaded()
         g_RoundActive = false;
     });
 
-    // Plugin loaded webhook (no Map/Players — not meaningful at load time)
-    if (g_Cfg.webhookPluginLoad)
-    {
-        ServerIdentity id = GetServerIdentity();
-        std::vector<WebhookField> fields = {
-            {"Server",              id.serverName,          true},
-            {"Address",             id.ip + ":" + std::to_string(id.port), true},
-        };
-        if (!id.serverGroup.empty())
-            fields.push_back({"Group", id.serverGroup, true});
-        if (!id.region.empty())
-            fields.push_back({"Region", id.region, true});
-        fields.push_back({"Version",            GetVersion(),               true});
-        fields.push_back({"MySQL",              g_SQLMM.IsConnected() ? "connected" : g_SQLMM.IsAvailable() ? "connecting" : "unavailable", true});
-        fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
-        fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
-        fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
-        fields.push_back({"Trigger Detection",  g_Cfg.triggerEnabled ? "on" : "off", true});
-        fields.push_back({"Debug Only",         (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "yes" : "no", true});
-        fields.push_back({"Punishment",         g_Cfg.punishType ? "ban" : "kick", true});
-        fields.push_back({"Threshold",          std::to_string(g_Cfg.violationThreshold), true});
-        WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
-    }
-
     // --- Timers ---
 
-    // Point decay
     g_pUtils->CreateTimer(g_Cfg.decayInterval, []() {
         DecayPoints();
         return g_Cfg.decayInterval;
     });
 
-    // DLL event-listener probe
     g_pUtils->CreateTimer(g_Cfg.dllInterval, []() {
         if (g_Cfg.enabled)
             RunDllDetection();
         return g_Cfg.dllInterval;
     });
 
-    // Hidden-target tracking
     if (g_Cfg.whEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.whCheckInterval, []() {
@@ -1726,7 +1748,6 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // Aim + trigger pattern detection
     if (g_Cfg.aimEnabled || g_Cfg.triggerEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.aimCheckInterval, []() {
@@ -1739,7 +1760,6 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // Composite risk check (slower interval)
     if (g_Cfg.compositeEnabled)
     {
         g_pUtils->CreateTimer(10.0f, []() {
@@ -1749,32 +1769,41 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // Server identity refresh (initial 2s delay for MySQL to connect, then periodic)
-    if (g_Cfg.dbEnabled && g_Cfg.identityEnabled)
-    {
-        g_pUtils->CreateTimer(2.0f, []() {
-            g_SQLMM.RefreshIdentity();
+    // Deferred startup: poll every 0.5s until MySQL connects + identity resolves (max 5s timeout)
+    // Then print banner + send webhook with resolved server name.
+    // If DB is disabled, fires immediately on first tick.
+    g_StartupDone = false;
+    g_StartupTicks = 0;
+    g_pUtils->CreateTimer(0.5f, []() {
+        if (g_StartupDone) {
+            // After startup is done, this timer becomes the identity refresh timer
+            if (g_Cfg.dbEnabled && g_Cfg.identityEnabled)
+                g_SQLMM.RefreshIdentity();
             return g_Cfg.identityRefreshInterval;
-        });
-    }
+        }
 
-    // Console startup banner (printed last so all init messages appear above it)
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] --------------------ANTIDLL LOADED-------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", GetVersion());
-    META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
-    META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
-    META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
-        g_SQLMM.IsConnected() ? "connected" :
-        g_SQLMM.IsAvailable() ? "connecting" :
-        g_Cfg.dbEnabled ? "unavailable" : "disabled");
-    META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
-    META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
-    META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
-        (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "on" : "off");
+        g_StartupTicks++;
+
+        // Try to connect + resolve identity each tick
+        if (g_Cfg.dbEnabled && g_SQLMM.IsAvailable())
+        {
+            if (g_SQLMM.IsConnected() && !g_SQLMM.IsIdentityResolved())
+                g_SQLMM.RefreshIdentity();
+        }
+
+        bool ready = !g_Cfg.dbEnabled
+            || !g_SQLMM.IsAvailable()
+            || g_SQLMM.IsIdentityResolved();
+        bool timeout = g_StartupTicks >= 10; // 10 * 0.5s = 5s
+
+        if (ready || timeout)
+        {
+            CompleteStartup();
+            return g_Cfg.identityRefreshInterval;
+        }
+
+        return 0.5f;
+    });
 }
 
 //==============================================================================

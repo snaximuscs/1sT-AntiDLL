@@ -30,6 +30,7 @@ public:
 
     bool IsAvailable()  const { return m_available; }
     bool IsConnected()  const { return m_connected; }
+    bool IsIdentityResolved() const { return m_identity.mysqlMatched || m_identityFailed; }
 
     ServerIdentity GetIdentity() const { return m_identity; }
 
@@ -56,4 +57,5 @@ private:
     std::string m_idTable;
     std::string m_idFailName;
     bool        m_hasIdQuery = false;
+    bool        m_identityFailed = false;
 };
