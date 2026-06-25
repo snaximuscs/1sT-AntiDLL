@@ -665,6 +665,7 @@ static void LoadEventFile()
 static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
 {
     const char* paths[] = {
+        "addons/configs/databases.cfg",
         "addons/counterstrikesharp/configs/databases.cfg",
         "configs/databases.cfg",
     };
