@@ -32,8 +32,6 @@ bool SQLMMManager::Init(ISQLInterface* sqlInterface,
 
     m_conn->Connect([this](bool success) {
         m_connected = success;
-        if (success && m_hasIdQuery)
-            RefreshIdentity();
     });
 
     return true;
@@ -63,9 +61,6 @@ void SQLMMManager::SetIdentityQuery(const std::string& ip, int port,
     m_identity.ip   = ip;
     m_identity.port = port;
     m_identity.serverName = failName;
-
-    if (m_connected)
-        RefreshIdentity();
 }
 
 void SQLMMManager::RefreshIdentity()

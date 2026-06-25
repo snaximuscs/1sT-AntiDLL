@@ -1749,10 +1749,10 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // Server identity refresh (periodic re-query via SQLMM)
+    // Server identity refresh (initial 2s delay for MySQL to connect, then periodic)
     if (g_Cfg.dbEnabled && g_Cfg.identityEnabled)
     {
-        g_pUtils->CreateTimer(g_Cfg.identityRefreshInterval, []() {
+        g_pUtils->CreateTimer(2.0f, []() {
             g_SQLMM.RefreshIdentity();
             return g_Cfg.identityRefreshInterval;
         });
