@@ -55,8 +55,8 @@ jobs:
 
           cd "$GITHUB_WORKSPACE"
           git clone https://github.com/pisex/SchemaEntity.git ../SchemaEntity
+          git clone https://github.com/DEVELOPER-FPB/Ray-Trace.git ../Ray-Trace || git clone https://github.com/FUNPLAY-pro-CS2/Ray-Trace.git ../Ray-Trace
 
-          echo "SchemaEntity-д CS2 SDK шинэчлэлтийн нөхөөс хийж байна..."
           sed -i 's/NetworkStateChanged_t/NetworkStateChangedData/g' ../SchemaEntity/schemasystem.cpp
 
       - name: Configure and build plugin

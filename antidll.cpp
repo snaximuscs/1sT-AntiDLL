@@ -714,8 +714,7 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
     out.database = pSection->GetString("database", "antidll");
     out.enabled  = true;
 
-    META_CONPRINTF("[1sT-AntiDLL] Loaded database config '%s' from %s (host=%s:%d db=%s)\n",
-        configName.c_str(), foundPath, out.host.c_str(), out.port, out.database.c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Database config loaded\n");
 
     delete pKV;
     return true;
