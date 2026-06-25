@@ -1675,17 +1675,22 @@ void AntiDLL::AllPluginsLoaded()
         WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
     }
 
-    // Console startup message
-    META_CONPRINTF("============================================\n");
-    META_CONPRINTF("  1sT-AntiDLL v%s loaded\n", GetVersion());
-    META_CONPRINTF("  Server: %s (%s)\n", GetServerDisplayName().c_str(), GetServerAddress().c_str());
-    META_CONPRINTF("  MySQL: %s  RayTrace: %s\n",
-        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"),
-        RayTrace_IsAvailable() ? "loaded" : "missing");
-    META_CONPRINTF("  WH: %s  Aim: %s  Trigger: %s  Composite: %s\n",
-        g_Cfg.whEnabled ? "on" : "off", g_Cfg.aimEnabled ? "on" : "off",
-        g_Cfg.triggerEnabled ? "on" : "off", g_Cfg.compositeEnabled ? "on" : "off");
-    META_CONPRINTF("============================================\n");
+    // Console startup banner
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] --------------------ANTIDLL LOADED-------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", GetVersion());
+    META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
+    META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
+        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"));
+    META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
+    META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
+    META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
+        (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "on" : "off");
 
     // --- Timers ---
 
