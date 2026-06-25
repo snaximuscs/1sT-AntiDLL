@@ -1678,23 +1678,6 @@ void AntiDLL::AllPluginsLoaded()
         WebhookSendRich("1sT-AntiDLL \xe2\x80\x94 plugin loaded", fields, 0x2ECC71);
     }
 
-    // Console startup banner
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] --------------------ANTIDLL LOADED-------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
-    META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", GetVersion());
-    META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
-    META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
-    META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
-    META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
-        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"));
-    META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
-    META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
-    META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
-        (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "on" : "off");
-
     // --- Timers ---
 
     // Point decay
@@ -1752,6 +1735,23 @@ void AntiDLL::AllPluginsLoaded()
             return g_Cfg.identityRefreshInterval;
         });
     }
+
+    // Console startup banner (printed last so all init messages appear above it)
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] --------------------ANTIDLL LOADED-------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] ------------------------------------------------------------\n");
+    META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", GetVersion());
+    META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
+    META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
+    META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
+        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"));
+    META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
+    META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
+    META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
+        (g_Cfg.whDebugOnly || g_Cfg.aimDebugOnly || g_Cfg.triggerDebugOnly) ? "on" : "off");
 }
 
 //==============================================================================
