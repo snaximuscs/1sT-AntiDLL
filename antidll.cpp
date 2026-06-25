@@ -690,7 +690,15 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
         return false;
     }
 
-    KeyValues* pSection = pKV->FindKey(configName.c_str());
+    KeyValues* pSection = nullptr;
+    for (KeyValues* pSub = pKV->GetFirstSubKey(); pSub; pSub = pSub->GetNextKey())
+    {
+        if (strcmp(pSub->GetName(), configName.c_str()) == 0)
+        {
+            pSection = pSub;
+            break;
+        }
+    }
     if (!pSection)
     {
         META_CONPRINTF("[1sT-AntiDLL] Database config '%s' not found in %s\n",
