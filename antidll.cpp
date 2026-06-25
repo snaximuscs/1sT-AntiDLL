@@ -1677,12 +1677,19 @@ void AntiDLL::AllPluginsLoaded()
         g_RoundActive = false;
     });
 
-    // Plugin loaded webhook
+    // Plugin loaded webhook (no Map/Players — not meaningful at load time)
     if (g_Cfg.webhookPluginLoad)
     {
-        auto fields = BuildServerFields();
+        ServerIdentity id = GetServerIdentity();
+        std::vector<WebhookField> fields = {
+            {"Server",              id.serverName,          true},
+            {"Address",             id.ip + ":" + std::to_string(id.port), true},
+        };
+        if (!id.serverGroup.empty())
+            fields.push_back({"Group", id.serverGroup, true});
+        if (!id.region.empty())
+            fields.push_back({"Region", id.region, true});
         fields.push_back({"Version",            GetVersion(),               true});
-        fields.push_back({"SQLMM",              g_SQLMM.IsAvailable() ? "loaded" : "missing", true});
         fields.push_back({"MySQL",              g_SQLMM.IsConnected() ? "connected" : g_SQLMM.IsAvailable() ? "connecting" : "unavailable", true});
         fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
         fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
@@ -1760,8 +1767,6 @@ void AntiDLL::AllPluginsLoaded()
     META_CONPRINTF("[1sT-AntiDLL] Version:      %s\n", GetVersion());
     META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
     META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
-    META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
-    META_CONPRINTF("[1sT-AntiDLL] SQLMM:        %s\n", g_SQLMM.IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
         g_SQLMM.IsConnected() ? "connected" :
         g_SQLMM.IsAvailable() ? "connecting" :
