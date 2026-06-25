@@ -1756,7 +1756,7 @@ void AntiDLL::AllPluginsLoaded()
 //==============================================================================
 
 const char* AntiDLL::GetLicense()     { return "GPL"; }
-const char* AntiDLL::GetVersion()     { return "1.1.0"; }
+const char* AntiDLL::GetVersion()     { return ANTIDLL_VERSION; }
 const char* AntiDLL::GetDate()        { return __DATE__; }
 const char* AntiDLL::GetLogTag()      { return "1sT-AntiDLL"; }
 const char* AntiDLL::GetAuthor()      { return "Snaximusss+"; }

@@ -1,5 +1,7 @@
 #pragma once
 
+#define ANTIDLL_VERSION "1.1.0"
+
 #include <ISmmPlugin.h>
 #include <entity2/entitysystem.h>
 #include "menus.h"
