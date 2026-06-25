@@ -4,7 +4,7 @@
 #include "schemasystem/schemasystem.h"
 #include "raytrace.h"
 #include "webhook_queue.h"
-#include "mysql_manager.h"
+#include "sqlmm_manager.h"
 #include <igameevents.h>
 #include <fstream>
 #include <ctime>
@@ -133,9 +133,10 @@ struct Config
     bool         webhookViolations  = true;
     bool         webhookPunishments = true;
 
-    // --- Database ---
+    // --- Database / SQLMM ---
     bool         dbEnabled     = false;
     std::string  dbConfigName  = "antidll";
+    bool         dbDebug       = false;
 
     // --- Server Identity ---
     bool         identityEnabled         = true;
@@ -145,13 +146,17 @@ struct Config
     std::string  identityFailName        = "Unknown Server";
 
     // Populated from configs/databases.cfg at load time
-    MySQLConfig  mysql;
+    std::string  dbHost;
+    int          dbPort = 3306;
+    std::string  dbUser;
+    std::string  dbPass;
+    std::string  dbDatabase;
 };
 
 static Config g_Cfg;
 static std::vector<std::string> g_vEvents;
 static WebhookQueue g_Webhook;
-static MySQLManager g_MySQL;
+static SQLMMManager g_SQLMM;
 
 //==============================================================================
 // PlayerState
@@ -444,8 +449,8 @@ static void DetectServerAddress()
 
 static ServerIdentity GetServerIdentity()
 {
-    if (g_MySQL.IsLoaded())
-        return g_MySQL.GetIdentity();
+    if (g_SQLMM.IsAvailable())
+        return g_SQLMM.GetIdentity();
 
     ServerIdentity id;
     id.serverName = g_Cfg.identityFailName;
@@ -542,20 +547,6 @@ static void LogStructured(const std::string& line)
 //==============================================================================
 // Discord webhook helpers — rich embed format
 //==============================================================================
-
-static std::string SqlEscape(const std::string& s)
-{
-    std::string out;
-    out.reserve(s.size() + 8);
-    for (char c : s)
-    {
-        if (c == '\'') { out += "''"; }
-        else if (c == '\\') { out += "\\\\"; }
-        else if (c == '\0') { /* drop */ }
-        else out.push_back(c);
-    }
-    return out;
-}
 
 static std::string JsonEscape(const std::string& s)
 {
@@ -662,7 +653,10 @@ static void LoadEventFile()
     file.close();
 }
 
-static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
+static bool LoadDatabaseConfig(const std::string& configName,
+                               std::string& outHost, int& outPort,
+                               std::string& outUser, std::string& outPass,
+                               std::string& outDatabase)
 {
     const char* paths[] = {
         "addons/configs/databases.cfg",
@@ -707,12 +701,11 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
         return false;
     }
 
-    out.host     = pSection->GetString("host", "127.0.0.1");
-    out.port     = pSection->GetInt("port", 3306);
-    out.user     = pSection->GetString("user", "root");
-    out.password = pSection->GetString("pass", "");
-    out.database = pSection->GetString("database", "antidll");
-    out.enabled  = true;
+    outHost     = pSection->GetString("host", "127.0.0.1");
+    outPort     = pSection->GetInt("port", 3306);
+    outUser     = pSection->GetString("user", "root");
+    outPass     = pSection->GetString("pass", "");
+    outDatabase = pSection->GetString("database", "antidll");
 
     META_CONPRINTF("[1sT-AntiDLL] Database config loaded\n");
 
@@ -804,9 +797,10 @@ static bool LoadConfig()
     c.webhookViolations  = pKV->GetBool("webhook_violations", true);
     c.webhookPunishments = pKV->GetBool("webhook_punishments", true);
 
-    // Database
+    // Database / SQLMM
     c.dbEnabled    = pKV->GetBool("database_enabled", false);
     c.dbConfigName = pKV->GetString("database_config", "antidll");
+    c.dbDebug      = pKV->GetBool("database_debug", false);
 
     // Server identity
     c.identityEnabled         = pKV->GetBool("server_identity_enabled", true);
@@ -818,16 +812,18 @@ static bool LoadConfig()
     // Load DB credentials from configs/databases.cfg (not from settings.ini)
     if (c.dbEnabled)
     {
-        if (!LoadDatabaseConfig(c.dbConfigName, c.mysql))
+        struct { std::string host; int port; std::string user; std::string pass; std::string database; } db;
+        if (!LoadDatabaseConfig(c.dbConfigName, db.host, db.port, db.user, db.pass, db.database))
         {
             c.dbEnabled = false;
-            c.mysql.enabled = false;
         }
         else
         {
-            c.mysql.serverTable    = c.identityTable;
-            c.mysql.detectionTable = c.detectionTable;
-            c.mysql.failName       = c.identityFailName;
+            c.dbHost     = db.host;
+            c.dbPort     = db.port;
+            c.dbUser     = db.user;
+            c.dbPass     = db.pass;
+            c.dbDatabase = db.database;
         }
     }
 
@@ -943,8 +939,8 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
         " player=" + szName + " steamid=" + szSteamID64 + " reason=\"" + reason + "\"" +
         " points=" + std::to_string(after) + "/" + std::to_string(g_Cfg.violationThreshold));
 
-    // MySQL detection log
-    if (g_MySQL.IsConnected())
+    // Detection log (async via SQLMM)
+    if (g_SQLMM.IsConnected())
     {
         ServerIdentity sid = GetServerIdentity();
         const char* playerIp = g_pPlayers->GetIpAddress(slot);
@@ -952,17 +948,17 @@ static void AddViolation(int slot, uint64 steamId, int points, const std::string
             " (server_name, server_group, region, server_ip, server_port, map_name,"
             " player_name, steamid64, player_ip, detection_category, detection_reason,"
             " points_added, points_total, threshold_points, action_taken, evidence_json)"
-            " VALUES ('" + SqlEscape(sid.serverName) + "','" + SqlEscape(sid.serverGroup) + "','" +
-            SqlEscape(sid.region) + "','" + SqlEscape(sid.ip) + "'," +
-            std::to_string(sid.port) + ",'" + SqlEscape(g_MapName) + "','" +
-            SqlEscape(szName) + "','" + szSteamID64 + "','" +
-            SqlEscape(playerIp ? playerIp : "") + "','" +
-            SqlEscape(DetCategoryStr(category)) + "','" + SqlEscape(reason) + "'," +
+            " VALUES ('" + g_SQLMM.Escape(sid.serverName) + "','" + g_SQLMM.Escape(sid.serverGroup) + "','" +
+            g_SQLMM.Escape(sid.region) + "','" + g_SQLMM.Escape(sid.ip) + "'," +
+            std::to_string(sid.port) + ",'" + g_SQLMM.Escape(g_MapName) + "','" +
+            g_SQLMM.Escape(szName) + "','" + szSteamID64 + "','" +
+            g_SQLMM.Escape(playerIp ? playerIp : "") + "','" +
+            g_SQLMM.Escape(DetCategoryStr(category)) + "','" + g_SQLMM.Escape(reason) + "'," +
             std::to_string(points) + "," + std::to_string(after) + "," +
             std::to_string(g_Cfg.violationThreshold) + ",'" +
             (doPunish ? (g_Cfg.punishType ? "ban" : "kick") : "none") + "','" +
-            SqlEscape(evidenceJson) + "')";
-        g_MySQL.QueueSQL(sql);
+            g_SQLMM.Escape(evidenceJson) + "')";
+        g_SQLMM.ExecuteSQL(sql);
     }
 
     // Webhook
@@ -1485,7 +1481,7 @@ CON_COMMAND_F(antidll_status, "Show 1sT-AntiDLL status", FCVAR_GAMEDLL | FCVAR_L
     META_CONPRINTF("  Server: %s (%s)\n", GetServerDisplayName().c_str(), GetServerAddress().c_str());
     META_CONPRINTF("  Map: %s  Players: %s\n", g_MapName.c_str(), GetPlayerCountStr().c_str());
     META_CONPRINTF("  MySQL: %s  RayTrace: %s\n",
-        g_MySQL.IsConnected() ? "connected" : (g_MySQL.IsLoaded() ? "loaded" : "disabled"),
+        g_SQLMM.IsConnected() ? "connected" : (g_SQLMM.IsAvailable() ? "loaded" : "disabled"),
         RayTrace_IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("  DLL Detection: on  WH Detection: %s  Aim: %s  Trigger: %s\n",
         g_Cfg.whEnabled ? "on" : "off",
@@ -1560,15 +1556,13 @@ CON_COMMAND_F(antidll_server_identity, "Show server identity info", FCVAR_GAMEDL
             g_Cfg.identityTable.c_str(), g_DetectedIp.c_str(), g_DetectedPort);
 }
 
-CON_COMMAND_F(antidll_mysql_status, "Show MySQL connection status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
+CON_COMMAND_F(antidll_sql_status, "Show SQLMM / database status", FCVAR_GAMEDLL | FCVAR_LINKED_CONCOMMAND)
 {
     META_CONPRINTF("[1sT-AntiDLL] Database:\n");
     META_CONPRINTF("  Enabled: %d  Config: '%s'\n", g_Cfg.dbEnabled, g_Cfg.dbConfigName.c_str());
-    META_CONPRINTF("  Library loaded: %d  Connected: %d\n", g_MySQL.IsLoaded(), g_MySQL.IsConnected());
-    if (g_Cfg.dbEnabled)
-        META_CONPRINTF("  Host: %s:%d  DB: %s  User: %s\n",
-            g_Cfg.mysql.host.c_str(), g_Cfg.mysql.port,
-            g_Cfg.mysql.database.c_str(), g_Cfg.mysql.user.c_str());
+    META_CONPRINTF("  SQLMM: %s  MySQL: %s\n",
+        g_SQLMM.IsAvailable() ? "loaded" : "missing",
+        g_SQLMM.IsConnected() ? "connected" : "disconnected");
     META_CONPRINTF("  Identity table: %s  Detection table: %s\n",
         g_Cfg.identityTable.c_str(), g_Cfg.detectionTable.c_str());
 }
@@ -1598,7 +1592,7 @@ bool AntiDLL::Load(PluginId id, ISmmAPI* ismm, char* error, size_t maxlen, bool 
 bool AntiDLL::Unload(char* error, size_t maxlen)
 {
     g_Webhook.Stop();
-    g_MySQL.Stop();
+    g_SQLMM.Shutdown();
     ConVar_Unregister();
     return true;
 }
@@ -1645,16 +1639,26 @@ void AntiDLL::AllPluginsLoaded()
                 "Hidden-target visibility checks and trigger detection are disabled.", 0xE67E22);
     }
 
-    // MySQL (optional) — server identity is resolved from DB, not config
+    // SQLMM database (optional)
     if (g_Cfg.dbEnabled)
     {
-        if (g_MySQL.Init(g_Cfg.mysql))
+        int sqlRet = 0;
+        ISQLInterface* sqlInterface = (ISQLInterface*)g_SMAPI->MetaFactory(SQLMM_INTERFACE, &sqlRet, NULL);
+        if (!sqlInterface || sqlRet == META_IFACE_FAILED)
         {
-            g_MySQL.RequestIdentityRefresh(g_DetectedIp, g_DetectedPort);
+            META_CONPRINTF("[1sT-AntiDLL] SQLMM interface not found. Database features disabled.\n");
+            g_Cfg.dbEnabled = false;
+        }
+        else if (!g_SQLMM.Init(sqlInterface, g_Cfg.dbHost, g_Cfg.dbPort,
+                                g_Cfg.dbUser, g_Cfg.dbPass, g_Cfg.dbDatabase))
+        {
+            META_CONPRINTF("[1sT-AntiDLL] Failed to create MySQL connection.\n");
+            g_Cfg.dbEnabled = false;
         }
         else
         {
-            g_Cfg.dbEnabled = false;
+            g_SQLMM.SetIdentityQuery(g_DetectedIp, g_DetectedPort,
+                g_Cfg.identityTable, g_Cfg.identityFailName);
         }
     }
 
@@ -1678,7 +1682,8 @@ void AntiDLL::AllPluginsLoaded()
     {
         auto fields = BuildServerFields();
         fields.push_back({"Version",            GetVersion(),               true});
-        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : g_MySQL.IsLoaded() ? "connecting" : "disabled", true});
+        fields.push_back({"SQLMM",              g_SQLMM.IsAvailable() ? "loaded" : "missing", true});
+        fields.push_back({"MySQL",              g_SQLMM.IsConnected() ? "connected" : g_SQLMM.IsAvailable() ? "connecting" : "unavailable", true});
         fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
         fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
         fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
@@ -1737,12 +1742,11 @@ void AntiDLL::AllPluginsLoaded()
         });
     }
 
-    // MySQL server identity refresh (periodic re-query)
+    // Server identity refresh (periodic re-query via SQLMM)
     if (g_Cfg.dbEnabled && g_Cfg.identityEnabled)
     {
         g_pUtils->CreateTimer(g_Cfg.identityRefreshInterval, []() {
-            if (g_MySQL.IsLoaded())
-                g_MySQL.RequestIdentityRefresh(g_DetectedIp, g_DetectedPort);
+            g_SQLMM.RefreshIdentity();
             return g_Cfg.identityRefreshInterval;
         });
     }
@@ -1757,10 +1761,11 @@ void AntiDLL::AllPluginsLoaded()
     META_CONPRINTF("[1sT-AntiDLL] Server:       %s\n", GetServerDisplayName().c_str());
     META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
     META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
+    META_CONPRINTF("[1sT-AntiDLL] SQLMM:        %s\n", g_SQLMM.IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
-        g_MySQL.IsConnected() ? "connected" :
-        g_MySQL.IsLoaded() ? "connecting" :
-        g_Cfg.dbEnabled ? "library not found" : "disabled");
+        g_SQLMM.IsConnected() ? "connected" :
+        g_SQLMM.IsAvailable() ? "connecting" :
+        g_Cfg.dbEnabled ? "unavailable" : "disabled");
     META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
     META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
