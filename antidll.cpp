@@ -1652,6 +1652,10 @@ void AntiDLL::AllPluginsLoaded()
         {
             g_MySQL.RequestIdentityRefresh(g_DetectedIp, g_DetectedPort);
         }
+        else
+        {
+            g_Cfg.dbEnabled = false;
+        }
     }
 
     // Webhook
@@ -1674,7 +1678,7 @@ void AntiDLL::AllPluginsLoaded()
     {
         auto fields = BuildServerFields();
         fields.push_back({"Version",            GetVersion(),               true});
-        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "connecting..." : "disabled"), true});
+        fields.push_back({"MySQL",              g_MySQL.IsConnected() ? "connected" : g_MySQL.IsLoaded() ? "connecting" : "disabled", true});
         fields.push_back({"RayTrace",           RayTrace_IsAvailable() ? "loaded" : "missing", true});
         fields.push_back({"WH Detection",       g_Cfg.whEnabled ? "on" : "off", true});
         fields.push_back({"Aim Detection",      g_Cfg.aimEnabled ? "on" : "off", true});
@@ -1754,7 +1758,9 @@ void AntiDLL::AllPluginsLoaded()
     META_CONPRINTF("[1sT-AntiDLL] Address:      %s\n", GetServerAddress().c_str());
     META_CONPRINTF("[1sT-AntiDLL] Map:          %s\n", g_MapName.c_str());
     META_CONPRINTF("[1sT-AntiDLL] MySQL:        %s\n",
-        g_MySQL.IsConnected() ? "connected" : (g_Cfg.dbEnabled ? "loading" : "disabled"));
+        g_MySQL.IsConnected() ? "connected" :
+        g_MySQL.IsLoaded() ? "connecting" :
+        g_Cfg.dbEnabled ? "library not found" : "disabled");
     META_CONPRINTF("[1sT-AntiDLL] RayTrace:     %s\n", RayTrace_IsAvailable() ? "loaded" : "missing");
     META_CONPRINTF("[1sT-AntiDLL] WH Detection: %s\n", g_Cfg.whEnabled ? "on" : "off");
     META_CONPRINTF("[1sT-AntiDLL] Debug Only:   %s\n",
