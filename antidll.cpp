@@ -685,7 +685,7 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
     if (!loaded)
     {
         META_CONPRINTF("[1sT-AntiDLL] databases.cfg not found in any search path\n");
-        pKV->deleteThis();
+        delete pKV;
         return false;
     }
 
@@ -694,7 +694,7 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
     {
         META_CONPRINTF("[1sT-AntiDLL] Database config '%s' not found in %s\n",
             configName.c_str(), foundPath);
-        pKV->deleteThis();
+        delete pKV;
         return false;
     }
 
@@ -708,7 +708,7 @@ static bool LoadDatabaseConfig(const std::string& configName, MySQLConfig& out)
     META_CONPRINTF("[1sT-AntiDLL] Loaded database config '%s' from %s (host=%s:%d db=%s)\n",
         configName.c_str(), foundPath, out.host.c_str(), out.port, out.database.c_str());
 
-    pKV->deleteThis();
+    delete pKV;
     return true;
 }
 
@@ -719,6 +719,7 @@ static bool LoadConfig()
     {
         if (g_pUtils)
             g_pUtils->ErrorLog("[%s] Failed to load config", g_PLAPI->GetLogTag());
+        delete pKV;
         return false;
     }
 
@@ -840,6 +841,7 @@ static bool LoadConfig()
     if (c.compositeBonusPoints > 100)  c.compositeBonusPoints = 100;
     if (c.identityRefreshInterval < 30.0f) c.identityRefreshInterval = 30.0f;
 
+    delete pKV;
     g_Cfg = c;
     RayTrace_SetDebugBeam(g_Cfg.raytraceDebugBeam);
     return true;
